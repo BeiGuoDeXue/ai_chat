@@ -88,18 +88,21 @@ class AudioChatServer:
         
         # 绘制波形图
         try:
-            plt.figure(figsize=(15, 5))
-            # 创建时间轴（将这行移到try块内）
+            plt.clf()  # 清除当前图形
+            # 创建时间轴
             time_axis = np.arange(len(audio_array)) / self.SAMPLE_RATE
             plt.plot(time_axis, audio_array)
-            plt.title('音频波形')
-            plt.xlabel('时间 (秒)')
-            plt.ylabel('振幅')
+            plt.title('Audio Waveform', fontsize=12)  # 使用英文避免乱码
+            plt.xlabel('Time (s)', fontsize=10)
+            plt.ylabel('Amplitude', fontsize=10)
             plt.grid(True)
             
-            # 保存图片
+            # 实时显示
+            plt.draw()
+            plt.pause(0.001)  # 短暂暂停以更新显示
+            
+            # 保存图片（可选）
             plt.savefig(f'audio_waveform_{int(time.time())}.png')
-            plt.close()
             
         except Exception as e:
             print(f"绘制波形图错误: {e}")
@@ -116,21 +119,47 @@ class AudioChatServer:
                 data.append(self.audio_buffer.popleft())
                 self.buffer_count -= 1
         
-        # 分析音频能量
-        self.analyze_audio_energy(bytes(data))
-        
         # 将字节数据转换为16位整数数组
         audio_array = np.frombuffer(bytes(data), dtype=np.int16)
+        
+        # 计算音频能量
         energy = np.mean(np.abs(audio_array))
         
-        # 从缓冲区提取数据
-        data = bytearray()
-        for _ in range(self.PROCESS_SIZE):
-            if self.audio_buffer:
-                data.append(self.audio_buffer.popleft())
-                self.buffer_count -= 1
+        # 根据波形图设置合适的阈值
+        SPEECH_THRESHOLD = 100  # 有声音的阈值
+        SILENCE_THRESHOLD = 20  # 静音阈值
         
-        return bytes(data)
+        # 初始化语音状态（如果未初始化）
+        if not hasattr(self, 'is_speaking'):
+            self.is_speaking = False
+            self.silence_frames = 0
+        
+        # 检测语音状态
+        if energy > SPEECH_THRESHOLD:
+            # 检测到说话
+            self.is_speaking = True
+            self.silence_frames = 0
+            return bytes(data)
+        elif energy < SILENCE_THRESHOLD:
+            # 检测到静音
+            if self.is_speaking:
+                # 如果之前在说话，开始计数静音帧
+                self.silence_frames += 1
+                # 连续0.5秒静音认为说话结束（8000采样率下约4帧）
+                if self.silence_frames > 4:
+                    self.is_speaking = False
+                    self.silence_frames = 0
+                    return bytes(data)  # 返回最后一帧
+            return None
+        else:
+            # 能量在两个阈值之间，保持当前状态
+            if self.is_speaking:
+                self.silence_frames = 0
+                return bytes(data)
+            return None
+
+        # 分析音频能量（用于调试）
+        # self.analyze_audio_energy(bytes(data))
 
     async def process_audio_loop(self):
         """定期处理音频数据的循环"""
@@ -155,8 +184,8 @@ class AudioChatServer:
                             # 文字转语音
                             audio_packets = self.text_to_speech(response_text)
                             # 先注释掉，调试下数据接收部分
-                            # if audio_packets:
-                            #     await self.send_queue.put(audio_packets)
+                            if audio_packets:
+                                await self.send_queue.put(audio_packets)
                     
                     self.is_processing = False
                 

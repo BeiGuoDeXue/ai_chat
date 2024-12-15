@@ -7,12 +7,13 @@
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
 
-#define MAX_AUDIO_BUFFER_SIZE 1024
+#define MAX_AUDIO_SAMPLES 1024  // 最大采样点数
+#define MAX_AUDIO_BUFFER_SIZE (MAX_AUDIO_SAMPLES * 2)  // 实际字节大小
 
 // 音频数据结构
 struct AudioData {
-    int16_t buffer[MAX_AUDIO_BUFFER_SIZE];
-    size_t size;
+    int16_t buffer[MAX_AUDIO_SAMPLES];  // 使用采样点数
+    size_t size;  // size 表示字节数
 };
 
 // WebSocket 客户端
@@ -47,44 +48,72 @@ TaskHandle_t wsTaskHandle;           // WebSocket任务
 static StaticJsonDocument<JSON_DOC_SIZE> g_jsonDoc;
 static uint8_t g_buffer[JSON_BUFFER_SIZE * 2];  // 合并后的单个缓冲区
 
+// 全局变量区域添加连接状态标志
+bool wsConnected = false;
+
 // WebSocket 事件处理
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
         case WStype_CONNECTED:
             Serial.println("WebSocket Connected");
+            wsConnected = true;
             break;
             
         case WStype_DISCONNECTED:
             Serial.println("WebSocket Disconnected");
+            wsConnected = false;
+            // 断开连接时清空所有队列
+            xQueueReset(wsOutQueue);
+            xQueueReset(audioOutputQueue);
             break;
             
         case WStype_TEXT: {
-            // 检查消息类型标记 (假设前5个字符是"audio")
-            if (length > 5 && strncmp((char*)payload, "audio", 5) == 0) {
-                // 直接从payload+5开始解码base64数据
-                size_t output_length;
-                if (mbedtls_base64_decode(
-                    (unsigned char*)g_buffer, 
-                    sizeof(g_buffer), 
-                    &output_length,
-                    (const unsigned char*)(payload + 5),
-                    length - 5
-                ) == 0) {
-                    
+            if (!wsConnected) {
+                Serial.println("Received data but not connected, ignoring");
+                return;
+            }
+            
+            // 添加try-catch块
+            try {
+                // 检查消息类型标记
+                if (length > 5 && strncmp((char*)payload, "audio", 5) == 0) {
+                    size_t output_length;
                     AudioData audioData;
-                    audioData.size = (output_length > MAX_AUDIO_BUFFER_SIZE) ? 
-                                   MAX_AUDIO_BUFFER_SIZE : output_length;
-                    memcpy(audioData.buffer, g_buffer, audioData.size); 
                     
-                    if (xQueueSend(audioOutputQueue, &audioData, pdMS_TO_TICKS(100)) != pdPASS) {
-                        Serial.println("音频输出队列已满");
+                    // 确保数据大小在合理范围内
+                    if (length > 5 && length < JSON_BUFFER_SIZE) {
+                        if (mbedtls_base64_decode(
+                            (unsigned char*)audioData.buffer,
+                            sizeof(audioData.buffer),
+                            &output_length,
+                            (const unsigned char*)(payload + 5),
+                            length - 5
+                        ) == 0) {
+                            
+                            audioData.size = output_length;
+                            if (xQueueSend(audioOutputQueue, &audioData, pdMS_TO_TICKS(100)) != pdPASS) {
+                                Serial.println("音频输出队列已满");
+                            }
+                        }
+                    } else {
+                        Serial.println("数据长度异常");
                     }
-                } else {
-                    Serial.println("Base64解码失败");
                 }
+            } catch (...) {
+                Serial.println("WebSocket数据处理异常");
             }
             break;
         }
+        
+        case WStype_ERROR:
+            Serial.println("WebSocket Error");
+            wsConnected = false;
+            break;
+            
+        case WStype_FRAGMENT_TEXT_START:
+        case WStype_FRAGMENT_BIN_START:
+            Serial.println("Fragment start - not supported");
+            break;
     }
 }
 
@@ -93,10 +122,13 @@ void audioInputTask(void *parameter) {
     while (true) {
         AudioData inputData;
         int bytes_read = read_mic_data(inputData.buffer, sizeof(inputData.buffer));
-        if(bytes_read > 0) {
+        if (bytes_read > 0) {
             inputData.size = bytes_read;
             if (xQueueSend(wsOutQueue, &inputData, 0) != pdPASS) {
                 Serial.println("Failed to queue input audio");
+                // 打印队列状态
+                UBaseType_t queueSize = uxQueueMessagesWaiting(wsOutQueue);
+                Serial.printf("Current queue size: %d\n", queueSize);
             }
 
             // if (xQueueSend(audioOutputQueue, &inputData, 0) != pdPASS) {
@@ -143,56 +175,55 @@ void webSocketLoopTask(void *parameter) {
 // WebSocket数据发送任务
 void webSocketSendTask(void *parameter) {
     AudioData wsData;
+    const TickType_t xDelay = pdMS_TO_TICKS(100); // 增加延时
+
     while (true) {
+        // 检查WebSocket连接状态
+        if (!wsConnected) {
+            vTaskDelay(xDelay);
+            continue;
+        }
+
         if (xQueueReceive(wsOutQueue, &wsData, 0) == pdPASS) {
-            // 打印调试信息
-            // Serial.printf("Raw audio size: %d, Buffer size: %d\n", 
-            //             wsData.size, sizeof(g_buffer));
-            
-            // 直接使用原始音频数据进行base64编码
-            size_t buffer_half = sizeof(g_buffer) / 2;
-            size_t output_length;
-            int result = mbedtls_base64_encode(
-                (unsigned char*)(g_buffer + buffer_half),
-                buffer_half,
-                &output_length,
-                (unsigned char*)wsData.buffer,  // 直接使用原始buffer
-                wsData.size
-            );
-            
-            if (result == 0) {
-                // 打印调试信息
-                // Serial.printf("Base64 length: %d\n", output_length);
+            // 检查数据大小（字节数）
+            if (wsData.size <= 0 || wsData.size > MAX_AUDIO_BUFFER_SIZE) {
+                Serial.printf("Invalid audio size (bytes): %d, max allowed: %d\n", 
+                    wsData.size, MAX_AUDIO_BUFFER_SIZE);
+                continue;
+            }
+
+            try {
+                size_t buffer_half = sizeof(g_buffer) / 2;
+                size_t output_length;
+
+                // 清空缓冲区
+                memset(g_buffer, 0, sizeof(g_buffer));
+
+                int result = mbedtls_base64_encode(
+                    (unsigned char*)(g_buffer + buffer_half),
+                    buffer_half,
+                    &output_length,
+                    (unsigned char*)wsData.buffer,
+                    wsData.size
+                );
                 
-                // 确保base64字符串正确终止
-                g_buffer[buffer_half + output_length] = '\0';
-                
-                // 打印base64数据的开头部分
-                char tempBuffer[100];
-                strncpy(tempBuffer, (char*)(g_buffer + buffer_half), 50);
-                tempBuffer[50] = '\0';
-                // Serial.printf("Base64 start: %s\n", tempBuffer);
-                
-                // 使用ArduinoJson构建JSON
-                g_jsonDoc.clear();
-                g_jsonDoc["type"] = "audio";
-                g_jsonDoc["data"] = (const char*)(g_buffer + buffer_half);
-                
-                // 序列化到g_buffer前半部分
-                size_t len = serializeJson(g_jsonDoc, (char*)g_buffer, buffer_half);
-                
-                // 打印JSON数据的开头部分
-                if (len > 0) {
-                    memcpy(tempBuffer, (char*)g_buffer, 50);
-                    tempBuffer[50] = '\0';
-                    // Serial.printf("JSON start: %s\n", tempBuffer);
+                if (result == 0 && output_length < buffer_half) {
+                    g_buffer[buffer_half + output_length] = '\0';
                     
-                    webSocket.sendTXT((char*)g_buffer, len);
-                    Serial.printf("JSON size: %d\n", len);
+                    g_jsonDoc.clear();
+                    g_jsonDoc["type"] = "audio";
+                    g_jsonDoc["data"] = (const char*)(g_buffer + buffer_half);
+                    
+                    size_t len = serializeJson(g_jsonDoc, (char*)g_buffer, buffer_half);
+                    
+                    if (len > 0 && len < buffer_half && wsConnected) {
+                        webSocket.sendTXT((char*)g_buffer, len);
+                    }
                 }
+            } catch (...) {
+                Serial.println("数据处理异常");
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -229,6 +260,7 @@ void setup() {
     webSocket.begin(wsHost, wsPort, wsPath);
     webSocket.onEvent(webSocketEvent);
     webSocket.setReconnectInterval(5000);
+    webSocket.enableHeartbeat(15000, 3000, 2);  // 启用心跳检测
     
     // 创建任务
     xTaskCreate(
@@ -254,16 +286,16 @@ void setup() {
         "WSLoop",
         4096,
         NULL,
-        2,  // 可以给连接维护更高的优先级
+        3,  // 可以给连接维护更高的优先级
         NULL
     );
     
     xTaskCreate(
         webSocketSendTask,
         "WSSend",
-        8192,
+        16384,  // 增加堆栈大小
         NULL,
-        1,
+        2,
         NULL
     );
 }
