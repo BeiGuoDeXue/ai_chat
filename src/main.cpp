@@ -47,10 +47,11 @@ TaskHandle_t wsTaskHandle;           // WebSocket任务
 // 全局变量区域
 static StaticJsonDocument<JSON_DOC_SIZE> g_jsonDoc;
 static uint8_t g_buffer[JSON_BUFFER_SIZE * 2];  // 合并后的单个缓冲区
+static DynamicJsonDocument g_doc(JSON_BUFFER_SIZE);  // 将解析数据的大变量放到全局变量
 
 // 全局变量区域添加连接状态标志
 bool wsConnected = false;
-
+time_t event_start_time = millis();
 // WebSocket 事件处理
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
@@ -60,7 +61,11 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             break;
             
         case WStype_DISCONNECTED:
-            Serial.println("WebSocket Disconnected");
+            if (payload != NULL) {
+                Serial.printf("WebSocket Disconnected, reason: %s\n", payload);  // 打印断开连接的原因
+            } else {
+                Serial.println("WebSocket Disconnected, reason: (null payload)");  // 处理空指针情况
+            }
             wsConnected = false;
             // 断开连接时清空所有队列
             xQueueReset(wsOutQueue);
@@ -72,32 +77,55 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                 Serial.println("Received data but not connected, ignoring");
                 return;
             }
+            if (payload == NULL)
+            {
+                Serial.println("payload is NULL");
+                break;
+            }
+            // 打印接收到的数据长度
+            Serial.printf("Received data length: %d\n", length);
+            // Serial.printf("Received data: %.*s\n", length, payload);  // 打印接收到的数据
             
             // 添加try-catch块
             try {
-                // 检查消息类型标记
-                if (length > 5 && strncmp((char*)payload, "audio", 5) == 0) {
-                    size_t output_length;
-                    AudioData audioData;
-                    
-                    // 确保数据大小在合理范围内
-                    if (length > 5 && length < JSON_BUFFER_SIZE) {
+                // 解析 JSON 数据
+                DeserializationError error = deserializeJson(g_doc, (const char*)payload);  // 使用全局变量
+                if (!error) {
+                    const char* type = g_doc["type"];  // 使用全局变量
+                    if (strcmp(type, "audio") == 0) {
+                        const char* base64Data = g_doc["data"];  // 使用全局变量
+                        size_t output_length;
+                        AudioData audioData;
+
+                        // 解码音频数据
+                        // TODO：后面把base64去掉
                         if (mbedtls_base64_decode(
                             (unsigned char*)audioData.buffer,
                             sizeof(audioData.buffer),
                             &output_length,
-                            (const unsigned char*)(payload + 5),
-                            length - 5
+                            (const unsigned char*)base64Data,
+                            strlen(base64Data)
                         ) == 0) {
-                            
                             audioData.size = output_length;
-                            if (xQueueSend(audioOutputQueue, &audioData, pdMS_TO_TICKS(100)) != pdPASS) {
+                            Serial.printf("output_length: %d\n", output_length);
+                            
+                            // 检查数据格式是否符合要求
+                            if (output_length % 2 != 0) {
+                                Serial.println("警告：PCM数据长度不是2的倍数");
+                                return;
+                            }
+                            
+                            // 发送到音频输出队列，阻塞时间改为0，避免阻塞音频数据
+                            if (xQueueSend(audioOutputQueue, &audioData, 0) != pdPASS) {
                                 Serial.println("音频输出队列已满");
                             }
+                            time_t end_time = millis();
+                            Serial.printf("event Time taken: %d ms\n", end_time - event_start_time);
+                            event_start_time = end_time;
                         }
-                    } else {
-                        Serial.println("数据长度异常");
                     }
+                } else {
+                    Serial.println("JSON解析错误");
                 }
             } catch (...) {
                 Serial.println("WebSocket数据处理异常");
@@ -109,7 +137,15 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             Serial.println("WebSocket Error");
             wsConnected = false;
             break;
-            
+
+        case WStype_PING:
+            Serial.println("Received PING, sending PONG");
+            break;
+
+        case WStype_PONG:
+            Serial.println("Received PONG");
+            break;
+
         case WStype_FRAGMENT_TEXT_START:
         case WStype_FRAGMENT_BIN_START:
             Serial.println("Fragment start - not supported");
@@ -125,10 +161,10 @@ void audioInputTask(void *parameter) {
         if (bytes_read > 0) {
             inputData.size = bytes_read;
             if (xQueueSend(wsOutQueue, &inputData, 0) != pdPASS) {
-                Serial.println("Failed to queue input audio");
-                // 打印队列状态
-                UBaseType_t queueSize = uxQueueMessagesWaiting(wsOutQueue);
-                Serial.printf("Current queue size: %d\n", queueSize);
+                // Serial.println("Failed to queue input audio");
+                // // 打印队列状态
+                // UBaseType_t queueSize = uxQueueMessagesWaiting(wsOutQueue);
+                // Serial.printf("Current queue size: %d\n", queueSize);
             }
 
             // if (xQueueSend(audioOutputQueue, &inputData, 0) != pdPASS) {
@@ -157,7 +193,6 @@ void audioOutputTask(void *parameter) {
             }
             // 检查输出队列是否为空，如果为空则关闭音频设备
             if (uxQueueMessagesWaiting(audioOutputQueue) == 0) {
-                // delay(10);
                 max98357_close();
             }
         }
@@ -253,7 +288,7 @@ void setup() {
     }
     
     // 创建队列
-    audioOutputQueue = xQueueCreate(16, sizeof(AudioData));
+    audioOutputQueue = xQueueCreate(32, sizeof(AudioData));
     wsOutQueue = xQueueCreate(5, sizeof(AudioData));
 
     // 设置WebSocket
@@ -284,10 +319,10 @@ void setup() {
     xTaskCreate(
         webSocketLoopTask,
         "WSLoop",
-        4096,
+        8192,
         NULL,
-        3,  // 可以给连接维护更高的优先级
-        NULL
+        3,
+        &wsTaskHandle  // 添加任务句柄
     );
     
     xTaskCreate(
