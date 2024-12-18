@@ -1,12 +1,11 @@
 import asyncio
-import json
-import base64
 import websockets
 from aip import AipSpeech
 import numpy as np
 from collections import deque
 import matplotlib.pyplot as plt
 import time
+from adpcm import ADPCMEncoder
 
 class AudioChatServer:
     def __init__(self):
@@ -31,6 +30,10 @@ class AudioChatServer:
         self.send_queue = asyncio.Queue(maxsize=100)  # 设置最大队列大小为100
         self.is_processing = False
 
+        # 初始化ADPCM编解码器
+        self.adpcm_encoder = ADPCMEncoder()
+        self.adpcm_decoder = ADPCMEncoder()
+
     async def handle_websocket(self, websocket):
         print("新客户端连接!")
         
@@ -42,11 +45,10 @@ class AudioChatServer:
         try:
             async for message in websocket:
                 try:
-                    data = json.loads(message)
-                    if data['type'] == 'audio':
-                        audio_data = base64.b64decode(data['data'])
-                        # 更新缓冲区
-                        self.update_buffer(audio_data)
+                    if isinstance(message, bytes):
+                        decoded_data = self.adpcm_decoder.decode_buffer(message)
+                        self.update_buffer(decoded_data)
+                        # await self.send_queue.put(decoded_data)  # 修改为直接放入音频数据
                 except Exception as e:
                     print(f"处理消息错误: {e}")
                     continue
@@ -60,6 +62,34 @@ class AudioChatServer:
                 await process_task
             except asyncio.CancelledError:
                 pass
+
+    async def send_audio_packets(self, websocket, audio_data):
+        try:
+            if websocket.closed:
+                print("WebSocket连接已关闭，无法发送数据")
+                return
+            
+            # PCM格式数据包大小(2048字节 = 1024个采样点)
+            PCM_PACKET_SIZE = 2048
+            
+            # 将音频数据分成多个包
+            for i in range(0, len(audio_data), PCM_PACKET_SIZE):
+                # 获取当前PCM数据包
+                packet = audio_data[i:i + PCM_PACKET_SIZE]
+                
+                # ADPCM编码(会自动将数据压缩为原来的1/4)
+                encoded_data = self.adpcm_encoder.encode_buffer(packet)
+                
+                # 发送编码后的数据包
+                await websocket.send(encoded_data)
+                
+                # 添加短暂延时，避免发送过快
+                # await asyncio.sleep(0.01)
+
+        except websockets.exceptions.ConnectionClosed as e:
+            print(f"WebSocket连接关闭: {e}")
+        except Exception as e:
+            print(f"发送数据包错误: {e}")
 
     def update_buffer(self, new_data):
         """更新循环缓冲区"""
@@ -166,30 +196,30 @@ class AudioChatServer:
         while True:
             try:
                 # 检查是否有足够的数据进行处理
-                if self.buffer_count >= self.PROCESS_SIZE:
-                    self.is_processing = True
+                # if self.buffer_count >= self.PROCESS_SIZE:
+                #     self.is_processing = True
                     
                     # 获取要处理的数据
-                    process_data = self.get_process_data()
-                    if process_data:
+                    # process_data = self.get_process_data()
+                    # if process_data:
                         # 语音转文字
                         # text = self.speech_to_text(process_data)
                         # if text:
                         #     print(f"识别到的文字: {text}")
 
                         # 处理响应
-                        response_text = "李梦丽"
-                        print(f"回复: {response_text}")
+                response_text = "李梦丽"
+                print(f"回复: {response_text}")
                         # 文字转语音
                         # audio_data = self.text_to_speech(response_text)
                         # # 生成假的音频数据并转换为字典格式
                         # audio_data = self.generate_fake_audio_data()
                         # 直接将音频数据放入发送队列
                         # await self.send_queue.put(audio_data)  # 修改为直接放入音频数据
-                        audio_data = self.read_audio("output1.pcm")
-                        # await self.send_queue.put(audio_data)  # 修改为直接放入音频数据
+                audio_data = self.read_audio("output.pcm")
+                await self.send_queue.put(audio_data)  # 修改为直接放入音频数据
                 # 短暂休眠
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(4)
 
             except Exception as e:
                 print(f"处理音频数据错误: {e}")
@@ -264,56 +294,6 @@ class AudioChatServer:
         """读取音频文件"""
         with open(filename, 'rb') as f:
             return f.read()  # 返回字节数据
-
-    async def send_audio_packets(self, websocket, packets):
-        """发送音频数据包"""
-        try:
-            # 检查WebSocket连接是否仍然打开
-            if websocket.closed:
-                print("WebSocket连接已关闭，无法发送数据")
-                return
-            
-            # 确保 packets 是 bytes 类型
-            if not isinstance(packets, (bytes, bytearray)):
-                print(f"数据包类型错误: {type(packets)}")
-                return
-            
-            print(f"准备发送数据包，长度: {len(packets)}")  # 添加调试信息
-            
-            # 分包发送
-            start = 0
-            while start < len(packets):
-                end = min(start + 2048, len(packets))  # 每次发送2048字节
-                chunk = packets[start:end]  # 使用切片获取字节数据
-                
-                # 检查数据包大小
-                if len(chunk) > 2048:
-                    print(f"数据包大小超出限制: {len(chunk)}")
-                    return
-                
-                # 检查数据有效性
-                try:
-                    message = {
-                        'type': 'audio',
-                        'data': base64.b64encode(chunk).decode('utf-8')  # 重新编码为base64
-                    }
-                    json_message = json.dumps(message)  # 确保消息是有效的JSON格式
-                    # print(f"发送数据块，起始: {start}, 结束: {end}, 长度: {len(chunk)}")  # 添加调试信息
-                    await websocket.send(json_message)
-                except Exception as e:
-                    print(f"构建或发送消息时出错: {e}")
-                    return
-                
-                start += 2048  # 更新起始位置
-                await asyncio.sleep(0.05)  # 每个包之间添加小延时
-
-            print("数据包发送完成")  # 添加日志信息
-        except websockets.exceptions.ConnectionClosed as e:
-            print(f"WebSocket连接关闭: {e}")
-        except Exception as e:
-            print(f"发送数据包错误: {e}")
-            print(f"出错的数据包: {packets[:50]}")
-            print(f"数据包类型: {type(packets)}")
 
     def generate_fake_audio_data(self):
         """生成假的音频数据"""

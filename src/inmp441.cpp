@@ -31,8 +31,6 @@ const i2s_pin_config_t inmp441_gpio_config = {
 int inmp441_init()
 {
     esp_err_t ret;
-    // 确保驱动未安装，防止重复初始化
-    i2s_driver_uninstall(I2S_NUM_0);
 
     // 安装I2S驱动
     ret = i2s_driver_install(I2S_NUM_0, &inmp441_i2s_config, 0, NULL);
@@ -107,7 +105,7 @@ void mic_data_handle(int16_t *data_in, size_t bytes_read) {
         }
         
         // 2. 音量调节
-        data_in[i] = data_in[i] * 2;
+        data_in[i] = data_in[i] * 4;
         
         // 3. 削波保护
         if(data_in[i] > 32767) data_in[i] = 32767;

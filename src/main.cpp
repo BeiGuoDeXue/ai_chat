@@ -1,11 +1,10 @@
 #include <WebSocketsClient.h>
-#include <ArduinoJson.h>
 #include "inmp441.h"
 #include "max98357.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "mbedtls/base64.h"
+#include "adpcm.h"
 
 #define MAX_AUDIO_SAMPLES 1024  // 最大采样点数
 #define MAX_AUDIO_BUFFER_SIZE (MAX_AUDIO_SAMPLES * 2)  // 实际字节大小
@@ -26,6 +25,9 @@ const char* wsPath = "/ws/esp32-client";
 const char *ssid = "2806";
 const char *password = "zhaokangxu";
 
+// ADPCM编码器
+ADPCMEncoder adpcmEncoder;  // 创建ADPCM编码器实例
+
 // 队列句柄
 QueueHandle_t audioOutputQueue;  // 音频输出队列
 QueueHandle_t wsOutQueue;       // WebSocket发送队列
@@ -35,25 +37,18 @@ TaskHandle_t audioInputTaskHandle;   // 音频输入任务
 TaskHandle_t audioOutputTaskHandle;  // 音频输出任务
 TaskHandle_t wsTaskHandle;           // WebSocket任务
 
-// 计算base64编码后的大小：(n + 2) / 3 * 4
-#define BASE64_ENCODE_SIZE(n) (((n) + 2) / 3 * 4)
-
-// JSON文档需要的大小 = base64编码后的大小 + JSON格式开销(约100字节)
-#define JSON_DOC_SIZE (BASE64_ENCODE_SIZE(MAX_AUDIO_BUFFER_SIZE * 2) + 100)
-
-// JSON序列化后的缓冲区大小 = JSON文档大小 + 额外的格式化空间(约200字节)
-#define JSON_BUFFER_SIZE (BASE64_ENCODE_SIZE(MAX_AUDIO_BUFFER_SIZE * 2) + 200)
-
-// 全局变量区域
-static StaticJsonDocument<JSON_DOC_SIZE> g_jsonDoc;
-static uint8_t g_buffer[JSON_BUFFER_SIZE * 2];  // 合并后的单个缓冲区
-static DynamicJsonDocument g_doc(JSON_BUFFER_SIZE);  // 将解析数据的大变量放到全局变量
 
 // 全局变量区域添加连接状态标志
 bool wsConnected = false;
 time_t event_start_time = millis();
+static AudioData recv_audioData;
+static AudioData wsData;
 // WebSocket 事件处理
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+    if (payload == NULL) {
+        Serial.printf("payload is NULL\n");
+        return;
+    }
     switch(type) {
         case WStype_CONNECTED:
             Serial.println("WebSocket Connected");
@@ -72,67 +67,6 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             xQueueReset(audioOutputQueue);
             break;
             
-        case WStype_TEXT: {
-            if (!wsConnected) {
-                Serial.println("Received data but not connected, ignoring");
-                return;
-            }
-            if (payload == NULL)
-            {
-                Serial.println("payload is NULL");
-                break;
-            }
-            // 打印接收到的数据长度
-            Serial.printf("Received data length: %d\n", length);
-            // Serial.printf("Received data: %.*s\n", length, payload);  // 打印接收到的数据
-            
-            // 添加try-catch块
-            try {
-                // 解析 JSON 数据
-                DeserializationError error = deserializeJson(g_doc, (const char*)payload);  // 使用全局变量
-                if (!error) {
-                    const char* type = g_doc["type"];  // 使用全局变量
-                    if (strcmp(type, "audio") == 0) {
-                        const char* base64Data = g_doc["data"];  // 使用全局变量
-                        size_t output_length;
-                        AudioData audioData;
-
-                        // 解码音频数据
-                        // TODO：后面把base64去掉
-                        if (mbedtls_base64_decode(
-                            (unsigned char*)audioData.buffer,
-                            sizeof(audioData.buffer),
-                            &output_length,
-                            (const unsigned char*)base64Data,
-                            strlen(base64Data)
-                        ) == 0) {
-                            audioData.size = output_length;
-                            Serial.printf("output_length: %d\n", output_length);
-                            
-                            // 检查数据格式是否符合要求
-                            if (output_length % 2 != 0) {
-                                Serial.println("警告：PCM数据长度不是2的倍数");
-                                return;
-                            }
-                            
-                            // 发送到音频输出队列，阻塞时间改为0，避免阻塞音频数据
-                            if (xQueueSend(audioOutputQueue, &audioData, 0) != pdPASS) {
-                                Serial.println("音频输出队列已满");
-                            }
-                            time_t end_time = millis();
-                            Serial.printf("event Time taken: %d ms\n", end_time - event_start_time);
-                            event_start_time = end_time;
-                        }
-                    }
-                } else {
-                    Serial.println("JSON解析错误");
-                }
-            } catch (...) {
-                Serial.println("WebSocket数据处理异常");
-            }
-            break;
-        }
-        
         case WStype_ERROR:
             Serial.println("WebSocket Error");
             wsConnected = false;
@@ -150,6 +84,26 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         case WStype_FRAGMENT_BIN_START:
             Serial.println("Fragment start - not supported");
             break;
+
+        case WStype_BIN: {
+            if (!wsConnected) return;
+            
+            try {
+                // ADPCM解码
+                recv_audioData.size = adpcmEncoder.decodeBuffer(
+                    payload,
+                    length,
+                    recv_audioData.buffer
+                ) * 2;  // 转换为字节数
+                if (xQueueSend(audioOutputQueue, &recv_audioData, 0) != pdPASS) {
+                    Serial.println("音频输出队列已满");
+                }
+                Serial.printf("recv_audioData.size: %d\n", recv_audioData.size);
+            } catch (...) {
+                Serial.println("WebSocket数据处理异常");
+            }
+            break;
+        }
     }
 }
 
@@ -160,6 +114,7 @@ void audioInputTask(void *parameter) {
         int bytes_read = read_mic_data(inputData.buffer, sizeof(inputData.buffer));
         if (bytes_read > 0) {
             inputData.size = bytes_read;
+            mic_data_handle(inputData.buffer, inputData.size);
             if (xQueueSend(wsOutQueue, &inputData, 0) != pdPASS) {
                 // Serial.println("Failed to queue input audio");
                 // // 打印队列状态
@@ -171,8 +126,6 @@ void audioInputTask(void *parameter) {
             //     Serial.println("Failed to audioOutputQueue queue input audio");
             // }
             // Serial.printf("inputData.size: %d\n", inputData.size);
-
-            // mic_data_handle(inputData.buffer, inputData.size);
 
         } else {
             max98357_close();
@@ -187,6 +140,7 @@ void audioOutputTask(void *parameter) {
     while (true) {
         if (xQueueReceive(audioOutputQueue, &outputData, portMAX_DELAY)) {
             max98357_open();
+            mic_data_handle(outputData.buffer, outputData.size);
             int bytes_write = write_max98357_data(outputData.buffer, outputData.size);
             if (bytes_write == -1) {
                 Serial.println("Error write I2S data");
@@ -207,54 +161,35 @@ void webSocketLoopTask(void *parameter) {
     }
 }
 
+uint8_t encoded_data[MAX_AUDIO_SAMPLES/2];  // ADPCM压缩后的大小
 // WebSocket数据发送任务
 void webSocketSendTask(void *parameter) {
-    AudioData wsData;
-    const TickType_t xDelay = pdMS_TO_TICKS(100); // 增加延时
-
     while (true) {
-        // 检查WebSocket连接状态
         if (!wsConnected) {
-            vTaskDelay(xDelay);
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
         if (xQueueReceive(wsOutQueue, &wsData, 0) == pdPASS) {
-            // 检查数据大小（字节数）
-            if (wsData.size <= 0 || wsData.size > MAX_AUDIO_BUFFER_SIZE) {
-                Serial.printf("Invalid audio size (bytes): %d, max allowed: %d\n", 
-                    wsData.size, MAX_AUDIO_BUFFER_SIZE);
-                continue;
-            }
-
             try {
-                size_t buffer_half = sizeof(g_buffer) / 2;
-                size_t output_length;
-
-                // 清空缓冲区
-                memset(g_buffer, 0, sizeof(g_buffer));
-
-                int result = mbedtls_base64_encode(
-                    (unsigned char*)(g_buffer + buffer_half),
-                    buffer_half,
-                    &output_length,
-                    (unsigned char*)wsData.buffer,
-                    wsData.size
-                );
-                
-                if (result == 0 && output_length < buffer_half) {
-                    g_buffer[buffer_half + output_length] = '\0';
-                    
-                    g_jsonDoc.clear();
-                    g_jsonDoc["type"] = "audio";
-                    g_jsonDoc["data"] = (const char*)(g_buffer + buffer_half);
-                    
-                    size_t len = serializeJson(g_jsonDoc, (char*)g_buffer, buffer_half);
-                    
-                    if (len > 0 && len < buffer_half && wsConnected) {
-                        webSocket.sendTXT((char*)g_buffer, len);
-                    }
+                // 检查输入数据大小是否超出范围
+                if(wsData.size > MAX_AUDIO_BUFFER_SIZE) {
+                    Serial.println("Input data too large");
+                    continue;
                 }
+                // ADPCM编码
+                size_t encoded_size = adpcmEncoder.encodeBuffer(
+                    wsData.buffer, 
+                    wsData.size/2,  // 转换为样本数
+                    encoded_data
+                );
+
+                if(encoded_size <= 0) {
+                    Serial.println("Encoding failed");
+                    continue;
+                }
+                // 发送二进制数据
+                webSocket.sendBIN(encoded_data, encoded_size);
             } catch (...) {
                 Serial.println("数据处理异常");
             }
