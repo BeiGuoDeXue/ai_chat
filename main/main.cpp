@@ -20,10 +20,10 @@
 
 #define MAX_AUDIO_SAMPLES 1024
 #define MAX_AUDIO_BUFFER_SIZE (MAX_AUDIO_SAMPLES * 2)
-#define MAX_PACKET_SIZE 1024  // 适当调整包大小
+#define MAX_PACKET_SIZE 150  // 适当调整包大小
 #define OPUS_FRAME_SIZE 160  // 与服务器编码帧大小保持一致
 #define OPUS_CODE_SIZE 20  // 与服务器编码帧大小保持一致
-#define DECODE_BUFFER_SIZE (MAX_PACKET_SIZE * 6)  // 增大环形缓冲区大小
+#define DECODE_BUFFER_SIZE (MAX_PACKET_SIZE * 10)  // 增大环形缓冲区大小
 
 static const char *TAG = "MAIN";
 
@@ -180,23 +180,14 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
 
             ESP_LOGI(TAG, "Received data len: %d", data->data_len);
             
-            // 每次处理160字节
-            const uint8_t* data_ptr = (const uint8_t*)data->data_ptr;
-            size_t remaining = data->data_len;
-            // TODO: 这了数据可能没发送完
-            while (remaining >= OPUS_CODE_SIZE) {
-                encoded_data_t encoded_data = {0};
-                memcpy(encoded_data.buffer, data_ptr, OPUS_CODE_SIZE);
-                encoded_data.size = OPUS_CODE_SIZE;
-                
-                // 发送到解码队列
-                if (xQueueSend(audioDecodeQueue, &encoded_data, 0) != pdPASS) {
-                    ESP_LOGW(TAG, "解码队列已满");
-                    break;
-                }
-                
-                data_ptr += OPUS_CODE_SIZE;
-                remaining -= OPUS_CODE_SIZE;
+            // 直接将接收到的数据转发到解码队列
+            encoded_data_t encoded_data = {0};
+            memcpy(encoded_data.buffer, data->data_ptr, data->data_len);
+            encoded_data.size = data->data_len;
+
+            // 发送到解码队列
+            if (xQueueSend(audioDecodeQueue, &encoded_data, 0) != pdPASS) {
+                ESP_LOGW(TAG, "解码队列已满");
             }
             break;
         }
@@ -243,12 +234,12 @@ static void audio_output_task(void *parameter)
 {
     audio_data_t outputData;
     size_t bytes_written;
-    
+    max98357_open();
     while (1) {
         if (xQueueReceive(audioOutputQueue, &outputData, portMAX_DELAY)) {
             // ESP_LOGI(TAG, "len: %d", outputData.size);
             // ESP_LOGI(TAG, "quenn size: %d", uxQueueMessagesWaiting(audioOutputQueue));
-            max98357_open();
+            mic_data_handle(outputData.buffer, outputData.size);
             esp_err_t ret = write_max98357_data(outputData.buffer, 
                                               outputData.size,
                                               &bytes_written);
@@ -350,24 +341,13 @@ static void audio_decode_task(void *parameter)
 
     while (1) {
         if (xQueueReceive(audioDecodeQueue, &encoded_data, portMAX_DELAY) == pdPASS) {
-            // 验证数据大小
-            if (encoded_data.size != OPUS_CODE_SIZE) {
-                ESP_LOGW(TAG, "无效的数据包大小: %d", encoded_data.size);
-                continue;
-            }
-
-            // 打印调试信息
-            ESP_LOGI(TAG, "解码长度: %d, 解码前数据前8字节: %d %d %d %d %d %d %d %d",
-                encoded_data.size,
-                encoded_data.buffer[0], encoded_data.buffer[1], encoded_data.buffer[2], encoded_data.buffer[3],
-                encoded_data.buffer[4], encoded_data.buffer[5], encoded_data.buffer[6], encoded_data.buffer[7]);
 
             // 解码
             int frame_size = opus_decode(decoder,
                                        encoded_data.buffer,
                                        encoded_data.size,
                                        decoded_buffer,
-                                       DECODE_BUFFER_SIZE,
+                                       960,
                                        0);
 
             if (frame_size < 0) {
@@ -382,9 +362,9 @@ static void audio_decode_task(void *parameter)
             outputData.size = frame_size * 2;  // 16位采样，所以乘2
             memcpy(outputData.buffer, decoded_buffer, outputData.size);
 
-            // if (xQueueSend(audioOutputQueue, &outputData, 0) != pdPASS) {
-            //     ESP_LOGW(TAG, "音频输出队列已满");
-            // }
+            if (xQueueSend(audioOutputQueue, &outputData, 0) != pdPASS) {
+                ESP_LOGW(TAG, "音频输出队列已满");
+            }
             // 添加短暂延时避免CPU占用过高
             vTaskDelay(pdMS_TO_TICKS(10));
         }
@@ -413,8 +393,8 @@ void app_main(void)
     // 创建队列
     audioOutputQueue = xQueueCreate(10, sizeof(audio_data_t));
     wsOutQueue = xQueueCreate(5, sizeof(encoded_data_t));
-    audioEncodeQueue = xQueueCreate(5, sizeof(audio_data_t));
-    audioDecodeQueue = xQueueCreate(10, sizeof(encoded_data_t));
+    audioEncodeQueue = xQueueCreate(20, sizeof(audio_data_t));
+    audioDecodeQueue = xQueueCreate(20, sizeof(encoded_data_t));
 
 
     // 初始化 WebSocket 客户端配置

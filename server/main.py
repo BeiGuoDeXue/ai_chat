@@ -89,16 +89,9 @@ class AudioChatServer:
             # 编码音频数据
             encoded_packets, stats = self.audio_codec.encode_audio(audio_array)
             
-            # 将所有编码后的数据合并成一个字节串
-            all_encoded_data = b''.join(encoded_packets)
-            encoded_size = len(all_encoded_data)
-            print(f"压缩后数据大小: {encoded_size} 字节")
-            print(f"压缩比率: {encoded_size / len(audio_array.tobytes()):.2%}")
-            
-            # 按1024字节大小分包发送
-            for i in range(0, encoded_size, self.PACKET_SIZE):
-                chunk = all_encoded_data[i:i + self.PACKET_SIZE]
-                await websocket.send(chunk)
+            # 直接发送每个编码后的数据包
+            for packet in encoded_packets:
+                await websocket.send(packet)
                 await asyncio.sleep(0.05)  # 短暂延迟，避免发送过快
 
         except websockets.exceptions.ConnectionClosed as e:
@@ -186,7 +179,7 @@ class AudioChatServer:
 
                 response_text = "李梦丽"
                 print(f"回复: {response_text}")
-                audio_data = self.read_audio("16k.pcm")
+                audio_data = self.read_audio("server/audio_files/beijingkejiguan.pcm")
                 await self.send_queue.put(audio_data)
                 await asyncio.sleep(6)
 
@@ -273,7 +266,7 @@ async def main():
         80
     ):
         print("WebSocket server started on ws://0.0.0.0:80/ws/esp32-client")
-        await asyncio.Future()  # 运行直到被中���
+        await asyncio.Future()  # 运行直到被中断
 
 if __name__ == "__main__":
     asyncio.run(main())
