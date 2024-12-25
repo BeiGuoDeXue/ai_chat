@@ -15,7 +15,11 @@
 #include <wifi_configuration_ap.h>
 #include <esp_websocket_client.h>
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_cpu.h"
 
+// 定义监控间隔（5秒）
+#define MONITOR_INTERVAL_MS 5000
 #define MAX_PACKET_SIZE 150  // 适当调整包大小
 #define OPUS_FRAME_SIZE 960  // 与服务器编码帧大小保持一致
 
@@ -91,12 +95,8 @@ static struct {
     uint16_t packet_count; // 当前包含的数据包数量
 } ws_send_buffer;
 
-// 全局变量
-static decoded_packets_buffer_t decoded_packets_buffer;
-static audio_ring_buffer_t audio_ring_buffer;
-
 // 在全局变量部分添加编码数据的ring buffer
-static struct {
+typedef struct {
     packet_data_t *packets;   // packet_data_t数组
     size_t capacity;          // 缓冲区能容纳的包数量
     size_t read_pos;
@@ -104,14 +104,101 @@ static struct {
     size_t packet_count;      // 当前缓冲区中的包数量
     SemaphoreHandle_t mutex;
     SemaphoreHandle_t data_ready;
-} encoded_packets_buffer;
+} encoded_packets_buffer_t;
 
 // 在全局变量部分
-static packet_data_t encoded_packets[20];  // 存储20个编码后的数据包
+static audio_ring_buffer_t audio_ring_buffer;
+static decoded_packets_buffer_t decoded_packets_buffer;
+static encoded_packets_buffer_t encoded_packets_buffer;
 
 // 初始化环形缓冲区
-static packet_data_t decoded_packets[50];  // 存储50个待解码的数据包
-static uint8_t audio_buffer[15536];        // 64KB音频输出缓冲区
+static uint8_t audio_buffer[32768];        // 32KB音频输出缓冲区
+static packet_data_t encoded_packets[20];  // 存储20个编码后的数据包
+static packet_data_t decoded_packets[35];  // 存储35个待解码的数据包
+
+// CPU使用率计算所需的变量
+static uint32_t prev_idle_ticks[2] = {0, 0};
+static uint32_t prev_total_ticks[2] = {0, 0};
+
+// 监控任务
+void monitor_task(void* arg)
+{
+    while(1) {
+        // 1. 内存使用情况
+        multi_heap_info_t heap_info;
+        heap_caps_get_info(&heap_info, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        
+        uint32_t free_heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        uint32_t min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        uint32_t total_heap = heap_info.total_allocated_bytes + heap_info.total_free_bytes;
+        
+        ESP_LOGI(TAG, "Memory Info:");
+        ESP_LOGI(TAG, "Total Heap: %ld bytes", total_heap);
+        ESP_LOGI(TAG, "Free Heap: %ld bytes", free_heap);
+        ESP_LOGI(TAG, "Minimum Free Heap: %ld bytes", min_free_heap);
+        ESP_LOGI(TAG, "Largest Free Block: %u", heap_info.largest_free_block);
+        
+        // 2. 获取运行时间
+        uint64_t current_time = esp_timer_get_time() / 1000000; // 转换为秒
+        ESP_LOGI(TAG, "System uptime: %llu seconds", current_time);
+        
+        // 3. 获取空闲任务的运行时间来估算CPU使用率
+        UBaseType_t idle0_priority = uxTaskPriorityGet(xTaskGetIdleTaskHandle());
+        UBaseType_t idle1_priority = uxTaskPriorityGet(xTaskGetIdleTaskHandleForCPU(1));
+        
+        ESP_LOGI(TAG, "\nTask Info:");
+        ESP_LOGI(TAG, "IDLE0 Priority: %u", idle0_priority);
+        ESP_LOGI(TAG, "IDLE1 Priority: %u", idle1_priority);
+        
+        // 4. 获取堆栈高水位线
+        UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
+        ESP_LOGI(TAG, "Current Task Stack Watermark: %u", watermark);
+        
+        // 5. 获取空闲堆大小
+        size_t free_heap_size = xPortGetFreeHeapSize();
+        size_t min_free_heap_size = xPortGetMinimumEverFreeHeapSize();
+        ESP_LOGI(TAG, "Current Free Heap: %u bytes", free_heap_size);
+        ESP_LOGI(TAG, "Minimum Ever Free Heap: %u bytes", min_free_heap_size);
+        
+        // CPU使用率监控
+        uint32_t current_idle0 = ulTaskGetIdleRunTimeCounter(); // Core 0空闲计数
+        uint32_t current_idle1 = ulTaskGetIdleRunTimeCounter(); // Core 1空闲计数
+        
+        // 获取总的运行时间
+        uint32_t total_ticks0 = esp_cpu_get_cycle_count(); // Core 0总计数
+        uint32_t total_ticks1 = esp_cpu_get_cycle_count(); // Core 1总计数
+
+        // 计算CPU使用率
+        float cpu_usage0 = 0;
+        float cpu_usage1 = 0;
+
+        if (prev_total_ticks[0] > 0) {
+            uint32_t idle_delta0 = current_idle0 - prev_idle_ticks[0];
+            uint32_t total_delta0 = total_ticks0 - prev_total_ticks[0];
+            if (total_delta0 > 0) {
+                cpu_usage0 = 100.0f * (1.0f - ((float)idle_delta0 / total_delta0));
+            }
+        }
+
+        if (prev_total_ticks[1] > 0) {
+            uint32_t idle_delta1 = current_idle1 - prev_idle_ticks[1];
+            uint32_t total_delta1 = total_ticks1 - prev_total_ticks[1];
+            if (total_delta1 > 0) {
+                cpu_usage1 = 100.0f * (1.0f - ((float)idle_delta1 / total_delta1));
+            }
+        }
+
+        // 更新上一次的计数
+        prev_idle_ticks[0] = current_idle0;
+        prev_idle_ticks[1] = current_idle1;
+        prev_total_ticks[0] = total_ticks0;
+        prev_total_ticks[1] = total_ticks1;
+
+        ESP_LOGI(TAG, "CPU Usage - Core 0: %.1f%%, Core 1: %.1f%%", cpu_usage0, cpu_usage1);
+
+        vTaskDelay(pdMS_TO_TICKS(MONITOR_INTERVAL_MS));
+    }
+}
 
 // 初始化码数据环形缓冲区
 static void decoded_packets_buffer_init(decoded_packets_buffer_t *rb, packet_data_t *buffer, size_t packet_count) {
@@ -330,7 +417,6 @@ static void audio_input_task(void *parameter)
     size_t bytes_read;
     
     while (1) {
-        ESP_LOGI(TAG, "Reading mic data");
         esp_err_t ret = read_mic_data(inputData.buffer, 
                                     sizeof(inputData.buffer), 
                                     &bytes_read);
@@ -353,7 +439,7 @@ static void audio_input_task(void *parameter)
         } else {
             ESP_LOGE(TAG, "Read mic data error");
         }
-        // vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -440,14 +526,36 @@ static void wifi_init(void)
 }
 
 // 初始化编码数据环形缓冲区
-static void encoded_packets_buffer_init(void) {
-    encoded_packets_buffer.packets = encoded_packets;
-    encoded_packets_buffer.capacity = 20;
-    encoded_packets_buffer.read_pos = 0;
-    encoded_packets_buffer.write_pos = 0;
-    encoded_packets_buffer.packet_count = 0;
-    encoded_packets_buffer.mutex = xSemaphoreCreateMutex();
-    encoded_packets_buffer.data_ready = xSemaphoreCreateBinary();
+static void encoded_packets_buffer_init(encoded_packets_buffer_t *rb, packet_data_t *buffer, size_t packet_count) {
+    rb->packets = buffer;
+    rb->capacity = packet_count;
+    rb->read_pos = 0;
+    rb->write_pos = 0;
+    rb->packet_count = 0;
+    rb->mutex = xSemaphoreCreateMutex();
+    rb->data_ready = xSemaphoreCreateBinary();
+}
+
+// 写入编码数据包
+static bool encoded_packets_buffer_write(encoded_packets_buffer_t *rb, const packet_data_t *packet) {
+    if (rb->packet_count >= rb->capacity) {
+        return false;
+    }
+    memcpy(&rb->packets[rb->write_pos], packet, sizeof(packet_data_t));
+    rb->write_pos = (rb->write_pos + 1) % rb->capacity;
+    rb->packet_count++;
+    return true;
+}
+
+// 读取编码数据包
+static bool encoded_packets_buffer_read(encoded_packets_buffer_t *rb, packet_data_t *packet) {
+    if (rb->packet_count == 0) {
+        return false;
+    }
+    memcpy(packet, &rb->packets[rb->read_pos], sizeof(packet_data_t));
+    rb->read_pos = (rb->read_pos + 1) % rb->capacity;
+    rb->packet_count--;
+    return true;
 }
 
 // 修改编码任务
@@ -455,7 +563,6 @@ static void audio_encode_task(void *parameter)
 {
     static audio_data_t inputData = {};
     static packet_data_t packet_data = {};
-    static uint8_t encoded_data[1000];
     
     while (1) {
         // 从输入队列接收音频数据
@@ -483,12 +590,7 @@ static void audio_encode_task(void *parameter)
             
             // 写入编码数据环形缓冲区
             if (xSemaphoreTake(encoded_packets_buffer.mutex, portMAX_DELAY) == pdTRUE) {
-                if (encoded_packets_buffer.packet_count < encoded_packets_buffer.capacity) {
-                    memcpy(&encoded_packets_buffer.packets[encoded_packets_buffer.write_pos], 
-                           &packet_data, sizeof(packet_data_t));
-                    encoded_packets_buffer.write_pos = 
-                        (encoded_packets_buffer.write_pos + 1) % encoded_packets_buffer.capacity;
-                    encoded_packets_buffer.packet_count++;
+                if (encoded_packets_buffer_write(&encoded_packets_buffer, &packet_data)) {
                     xSemaphoreGive(encoded_packets_buffer.data_ready);
                 } else {
                     ESP_LOGW(TAG, "Encoded packets buffer full");
@@ -568,15 +670,7 @@ static void websocket_send_task(void *parameter)
                 
                 // 从编码环形缓冲区读取数据
                 if (xSemaphoreTake(encoded_packets_buffer.mutex, portMAX_DELAY) == pdTRUE) {
-                    if (encoded_packets_buffer.packet_count > 0) {
-                        memcpy(&packet_data, 
-                               &encoded_packets_buffer.packets[encoded_packets_buffer.read_pos],
-                               sizeof(packet_data_t));
-                        encoded_packets_buffer.read_pos = 
-                            (encoded_packets_buffer.read_pos + 1) % encoded_packets_buffer.capacity;
-                        encoded_packets_buffer.packet_count--;
-                        has_data = true;
-                    }
+                    has_data = encoded_packets_buffer_read(&encoded_packets_buffer, &packet_data);
                     xSemaphoreGive(encoded_packets_buffer.mutex);
                 }
 
@@ -676,9 +770,9 @@ void app_main(void)
     audioEncodeQueue = xQueueCreate(5, sizeof(audio_data_t));
 
     // 初始化缓冲区
-    decoded_packets_buffer_init(&decoded_packets_buffer, decoded_packets, 50);
+    decoded_packets_buffer_init(&decoded_packets_buffer, decoded_packets, 35);
     audio_ring_buffer_init(&audio_ring_buffer, audio_buffer, sizeof(audio_buffer));
-    encoded_packets_buffer_init();
+    encoded_packets_buffer_init(&encoded_packets_buffer, encoded_packets, 20);
     
     // 初始化发送缓冲区
     ws_send_buffer.current_size = sizeof(packet_header_t);
@@ -701,34 +795,45 @@ void app_main(void)
     BaseType_t xReturned;
     
     // 创建音频输入任务
-    xReturned = xTaskCreate(audio_input_task, "AudioInput", 8192, NULL, 5, &audioInputTaskHandle);
+    xReturned = xTaskCreatePinnedToCore(audio_input_task, "AudioInput", 8192, NULL, 5, &audioInputTaskHandle, 0);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio input task");
     }
 
     // 创建编码任务
-    xReturned = xTaskCreate(audio_encode_task, "AudioEncode", 32000, NULL, 4, NULL);
+    xReturned = xTaskCreatePinnedToCore(audio_encode_task, "AudioEncode", 32768, NULL, 4, NULL, 1);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio encode task");
     }
 
     // 创建解码任务
-    xReturned = xTaskCreate(audio_decode_task, "AudioDecode", 8192 * 2, NULL, 4, NULL);
+    xReturned = xTaskCreatePinnedToCore(audio_decode_task, "AudioDecode", 8192 * 2, NULL, 4, NULL, 1);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio decode task");
     }
 
     // 创建音频输出任务
-    xReturned = xTaskCreate(audio_output_task, "AudioOutput", 4096, NULL, 3, &audioOutputTaskHandle);
+    xReturned = xTaskCreatePinnedToCore(audio_output_task, "AudioOutput", 4096, NULL, 3, &audioOutputTaskHandle, 1);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio output task");
     }
 
     // 创建WebSocket发送任务
-    xReturned = xTaskCreate(websocket_send_task, "WSSend", 8192, NULL, 4, &wsTaskHandle);
+    xReturned = xTaskCreatePinnedToCore(websocket_send_task, "WSSend", 8192, NULL, 4, &wsTaskHandle, 0);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create websocket send task");
     }
+
+    // 创建监控任务
+    xTaskCreatePinnedToCore(
+        monitor_task,
+        "monitor",
+        4096,
+        NULL,
+        1, // 低优先级
+        NULL,
+        0 // 在Core 0上运行
+    );
 
     ESP_LOGI(TAG, "All tasks created successfully");
 }
