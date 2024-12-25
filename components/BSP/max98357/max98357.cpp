@@ -115,15 +115,15 @@ esp_err_t max98357_open(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t ret = i2s_start(I2S_NUM_1);
-    if (ret != ESP_OK) {
-        return ret;
-    }
+    // esp_err_t ret = i2s_start(I2S_NUM_1);
+    // if (ret != ESP_OK) {
+    //     return ret;
+    // }
 
-    ret = i2s_zero_dma_buffer(I2S_NUM_1);
-    if (ret != ESP_OK) {
-        return ret;
-    }
+    // ret = i2s_zero_dma_buffer(I2S_NUM_1);
+    // if (ret != ESP_OK) {
+    //     return ret;
+    // }
 
     return gpio_set_level(MAX98357_SD_MODE_PIN, 1);
 }

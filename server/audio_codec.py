@@ -49,7 +49,7 @@ class AudioCodec:
                 frame_bytes = frame.tobytes()
                 encoded = self.encoder.encode(frame_bytes, self.FRAME_SIZE)
                 encoded_data.append(encoded)
-                print(f"编码后的数据大小: {len(encoded)} 字节")
+                # print(f"编码后的数据大小: {len(encoded)} 字节")
             
             encoding_time = time.time() - start_time
             total_encoded_size = sum(len(x) for x in encoded_data)
