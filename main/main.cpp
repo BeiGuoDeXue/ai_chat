@@ -111,7 +111,7 @@ static packet_data_t encoded_packets[20];  // 存储20个编码后的数据包
 
 // 初始化环形缓冲区
 static packet_data_t decoded_packets[50];  // 存储50个待解码的数据包
-static uint8_t audio_buffer[65536];        // 64KB音频输出缓冲区
+static uint8_t audio_buffer[15536];        // 64KB音频输出缓冲区
 
 // 初始化码数据环形缓冲区
 static void decoded_packets_buffer_init(decoded_packets_buffer_t *rb, packet_data_t *buffer, size_t packet_count) {
@@ -464,37 +464,37 @@ static void audio_encode_task(void *parameter)
                 ESP_LOGE(TAG, "Input data size is not valid: %d", inputData.size);
                 continue;
             }
-            // // 编码
-            // uint64_t start_time = esp_timer_get_time();
-            // int encoded_size = opus_encode(encoder, inputData.buffer, OPUS_FRAME_SIZE, 
-            //                             packet_data.data, sizeof(packet_data.data));
-            // uint64_t end_time = esp_timer_get_time();
-            // ESP_LOGI(TAG, "Encoding time: %llu microseconds", end_time - start_time);
+            // 编码
+            uint64_t start_time = esp_timer_get_time();
+            int encoded_size = opus_encode(encoder, inputData.buffer, OPUS_FRAME_SIZE, 
+                                        packet_data.data, sizeof(packet_data.data));
+            uint64_t end_time = esp_timer_get_time();
+            ESP_LOGI(TAG, "Encoding time: %llu microseconds", end_time - start_time);
 
-            // if (encoded_size < 0) {
-            //     ESP_LOGE(TAG, "Opus编码错误: %d", encoded_size);
-            //     continue;
-            // } else if (encoded_size > MAX_PACKET_SIZE) {
-            //     ESP_LOGE(TAG, "Encoded packet size exceeds maximum: %d", encoded_size);
-            //     continue;
-            // }
+            if (encoded_size < 0) {
+                ESP_LOGE(TAG, "Opus编码错误: %d", encoded_size);
+                continue;
+            } else if (encoded_size > MAX_PACKET_SIZE) {
+                ESP_LOGE(TAG, "Encoded packet size exceeds maximum: %d", encoded_size);
+                continue;
+            }
 
-            // packet_data.data_length = encoded_size;
+            packet_data.data_length = encoded_size;
             
-            // // 写入编码数据环形缓冲区
-            // if (xSemaphoreTake(encoded_packets_buffer.mutex, portMAX_DELAY) == pdTRUE) {
-            //     if (encoded_packets_buffer.packet_count < encoded_packets_buffer.capacity) {
-            //         memcpy(&encoded_packets_buffer.packets[encoded_packets_buffer.write_pos], 
-            //                &packet_data, sizeof(packet_data_t));
-            //         encoded_packets_buffer.write_pos = 
-            //             (encoded_packets_buffer.write_pos + 1) % encoded_packets_buffer.capacity;
-            //         encoded_packets_buffer.packet_count++;
-            //         xSemaphoreGive(encoded_packets_buffer.data_ready);
-            //     } else {
-            //         ESP_LOGW(TAG, "Encoded packets buffer full");
-            //     }
-            //     xSemaphoreGive(encoded_packets_buffer.mutex);
-            // }
+            // 写入编码数据环形缓冲区
+            if (xSemaphoreTake(encoded_packets_buffer.mutex, portMAX_DELAY) == pdTRUE) {
+                if (encoded_packets_buffer.packet_count < encoded_packets_buffer.capacity) {
+                    memcpy(&encoded_packets_buffer.packets[encoded_packets_buffer.write_pos], 
+                           &packet_data, sizeof(packet_data_t));
+                    encoded_packets_buffer.write_pos = 
+                        (encoded_packets_buffer.write_pos + 1) % encoded_packets_buffer.capacity;
+                    encoded_packets_buffer.packet_count++;
+                    xSemaphoreGive(encoded_packets_buffer.data_ready);
+                } else {
+                    ESP_LOGW(TAG, "Encoded packets buffer full");
+                }
+                xSemaphoreGive(encoded_packets_buffer.mutex);
+            }
         }
     }
 }
@@ -664,6 +664,10 @@ void app_main(void)
     // 初始化音频设备
     ESP_ERROR_CHECK(max98357_init());
     ESP_ERROR_CHECK(inmp441_init());
+    int dec_size = opus_decoder_get_size(1);
+    ESP_LOGI(TAG, "解码器所需空间大小: %d", dec_size);
+    int enc_size = opus_encoder_get_size(1);
+    ESP_LOGI(TAG, "编码器所需空间大小: %d", enc_size);
 
     // 初始化Opus编码器和解码器
     ESP_ERROR_CHECK(init_opus());
@@ -703,7 +707,7 @@ void app_main(void)
     }
 
     // 创建编码任务
-    xReturned = xTaskCreate(audio_encode_task, "AudioEncode", 8192, NULL, 4, NULL);
+    xReturned = xTaskCreate(audio_encode_task, "AudioEncode", 32000, NULL, 4, NULL);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio encode task");
     }

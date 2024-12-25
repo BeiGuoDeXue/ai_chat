@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "opus_encoder.h"
 #include "opus_decoder.h"
@@ -21,10 +23,15 @@ static const char* TAG = "OPUS_TEST1";
 
 void run_opus_test(void) {
     ESP_LOGI(TAG, "开始编解码测试...");
-
+    int enc_size = opus_encoder_get_size(1); // 获取编码器所需空间大小
+    ESP_LOGI(TAG, "编码器所需空间大小: %d", enc_size);
     // 创建编码器和解码器
-    OpusEncoderWrapper encoder(SAMPLE_RATE, CHANNELS, DURATION_MS);
-    OpusDecoderWrapper decoder(SAMPLE_RATE, CHANNELS);
+    std::unique_ptr<OpusEncoderWrapper> encoder(new OpusEncoderWrapper(SAMPLE_RATE, CHANNELS, DURATION_MS));
+    std::unique_ptr<OpusDecoderWrapper> decoder(new OpusDecoderWrapper(SAMPLE_RATE, CHANNELS));
+
+    // 降低编码器复杂度
+    encoder->SetComplexity(1);
+    encoder->SetDtx(false);
 
     // 生成测试数据 - 正弦波
     std::vector<int16_t> input_signal;
@@ -38,12 +45,11 @@ void run_opus_test(void) {
         input_signal.push_back((int16_t)(32767.0 * sin(angle)));
     }
 
-    // 保存一份原始信号的副本用于后续比较
+    // 保存一份原始信号的副本
     std::vector<int16_t> original_signal = input_signal;
 
     // 打印原始信号的前几个样本
     ESP_LOGI(TAG, "原始信号大小: %d 采样点", input_signal.size());
-    ESP_LOGI(TAG, "原始信号前5个样本:");
     for (int i = 0; i < 5 && i < input_signal.size(); i++) {
         ESP_LOGI(TAG, "sample[%d] = %d", i, input_signal[i]);
     }
@@ -53,18 +59,10 @@ void run_opus_test(void) {
     std::vector<uint8_t> encoded_data;
     bool encode_success = false;
 
-    encoder.Encode(std::move(input_signal), [&](std::vector<uint8_t>&& opus) {
+    encoder->Encode(std::move(input_signal), [&](std::vector<uint8_t>&& opus) {
         encoded_data = std::move(opus);
         encode_success = true;
         ESP_LOGI(TAG, "编码成功，编码后大小: %d bytes", encoded_data.size());
-        
-        // 打印编码数据的前几个字节
-        if (!encoded_data.empty()) {
-            ESP_LOGI(TAG, "编码数据前8字节:");
-            for (int i = 0; i < 8 && i < encoded_data.size(); i++) {
-                ESP_LOGI(TAG, "byte[%d] = 0x%02X", i, encoded_data[i]);
-            }
-        }
     });
 
     if (!encode_success) {
@@ -72,10 +70,13 @@ void run_opus_test(void) {
         return;
     }
 
+    // 给系统一些时间处理其他任务
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     // 解码
     ESP_LOGI(TAG, "开始解码...");
     std::vector<int16_t> decoded_signal;
-    bool decode_success = decoder.Decode(std::move(encoded_data), decoded_signal);
+    bool decode_success = decoder->Decode(std::move(encoded_data), decoded_signal);
 
     if (!decode_success) {
         ESP_LOGE(TAG, "解码失败");
