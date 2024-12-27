@@ -8,9 +8,10 @@ from audio_codec import AudioCodec
 import threading
 import struct
 import pyaudio
-from openai import OpenAI
 import os
 import wave  # 添加到文件顶部的导入语句中
+from llm.zhipu_client import ZhipuClient
+from llm.volcengine_client import VolcengineClient
 
 class AudioPacketManager:
     def __init__(self):
@@ -157,12 +158,17 @@ class AudioChatServer:
         
         self.packet_manager = AudioPacketManager()
 
-        # 初始化火山云客户端
-        self.llm_client = OpenAI(
-            api_key=os.environ.get("ARK_API_KEY"),
-            base_url="https://ark.cn-beijing.volces.com/api/v3"
+        # 初始化LLM客户端
+        self.zhipu_client = ZhipuClient(
+            server_host="qzvdrb.natappfree.cc",
+            api_key="my-test-key-2024"
         )
-        self.model_id = "ep-20241226171735-z9tvd"
+        self.volcengine_client = VolcengineClient(
+            api_key=os.environ.get("ARK_API_KEY")
+        )
+        
+        # 默认使用智谱AI
+        self.current_llm = "volcengine"  # 可以是 "zhipu" 或 "volcengine"
 
     def start_recording(self):
         """开始录音"""
@@ -306,6 +312,8 @@ class AudioChatServer:
             # 检测到说话
             self.is_speaking = True
             self.silence_frames = 0
+            self.audio_buffer.clear()
+            self.buffer_count = 0
             return bytes(data)
         elif energy < SILENCE_THRESHOLD:
             # 检测到静音
@@ -432,7 +440,7 @@ class AudioChatServer:
             result = self.baidu_client.synthesis(text, 'zh', 1, {
                 'spd': 5,  # 语速，取值0-15
                 'pit': 5,  # 音调，取值0-15
-                'vol': 3,  # 音量，取值0-15
+                'vol': 1,  # 音量，取值0-15
                 'per': 1,  # 发音人，0为女声，1为男声，3为情感男声，4为情感女声
                 'aue': 6,  # 返回PCM格式音频
             })
@@ -459,20 +467,12 @@ class AudioChatServer:
         self.stop_recording()
         self.audio.terminate()
 
-    async def get_llm_response(self, text):
-        """调用火山云大语言模型获取回复"""
-        try:
-            completion = self.llm_client.chat.completions.create(
-                model=self.model_id,
-                messages=[
-                    {"role": "system", "content": "你是一个智能助手，请用简短的语言回答问题。"},
-                    {"role": "user", "content": text}
-                ]
-            )
-            return completion.choices[0].message.content
-        except Exception as e:
-            print(f"调用大语言模型出错: {e}")
-            return "抱歉，我现在无法回答这个问题。"
+    async def get_llm_response(self, text: str) -> str:
+        """获取大语言模型回复"""
+        if self.current_llm == "zhipu":
+            return await self.zhipu_client.get_response(text)
+        else:
+            return await self.volcengine_client.get_response(text)
 
 async def main():
     server = AudioChatServer()
