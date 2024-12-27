@@ -12,6 +12,7 @@ import os
 import wave  # 添加到文件顶部的导入语句中
 from llm.zhipu_client import ZhipuClient
 from llm.volcengine_client import VolcengineClient
+import webrtcvad
 
 class AudioPacketManager:
     def __init__(self):
@@ -155,6 +156,7 @@ class AudioChatServer:
 
         # 数据发送完成
         self.data_send_complete = True
+        self.data_send_complete_last = False
         
         self.packet_manager = AudioPacketManager()
 
@@ -169,6 +171,21 @@ class AudioChatServer:
         
         # 默认使用智谱AI
         self.current_llm = "volcengine"  # 可以是 "zhipu" 或 "volcengine"
+
+        # 初始化 WebRTC VAD
+        self.vad = webrtcvad.Vad()
+        # 设置VAD的激进程度 (0-3)，数字越大越激进
+        # 0: 最不激进，容易检测到语音
+        # 3: 最激进，只检测很确定的语音
+        self.vad.set_mode(3)
+        
+        # VAD 相关参数
+        self.vad_frame_duration = 30  # 每帧持续时间(ms)，可选值：10, 20, 30
+        self.vad_frame_size = int(self.RATE * self.vad_frame_duration / 1000) * 2  # 每帧样本数
+        self.vad_active_frames = 0  # 连续检测到语音的帧数
+        self.vad_inactive_frames = 0  # 连续检测到静音的帧数
+        self.speech_started = False  # 是否开始检测到语音
+        self.speech_buffer = bytearray()  # 存储语音数据
 
     def start_recording(self):
         """开始录音"""
@@ -202,16 +219,13 @@ class AudioChatServer:
         """录音线程"""
         while self.is_recording:
             if self.data_send_complete:
-                # print("record data_send_complete: ", self.data_send_complete)
                 try:
                     # 读取音频数据
-                    audio_data = self.stream.read(self.CHUNK)
-                    # 转换为numpy数组
-                    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                    audio_data = self.stream.read(self.CHUNK, exception_on_overflow=False)
                     
                     # 更新缓冲区
                     with self.buffer_lock:
-                        self.update_buffer(audio_array.tobytes())
+                        self.update_buffer(audio_data)
 
                 except Exception as e:
                     print(f"录音错误: {e}")
@@ -286,51 +300,63 @@ class AudioChatServer:
             self.buffer_count = min(self.buffer_count + 1, self.BUFFER_SIZE)
 
     def get_process_data(self):
-        """获取待处理的数据，并检测语音结束"""
-        if self.buffer_count < self.PROCESS_SIZE:
+        """使用 WebRTC VAD 获取待处理的数据，并检测语音结束"""
+        try:
+            if self.buffer_count < self.vad_frame_size:
+                return None
+
+            # 从缓冲区提取一帧数据
+            frame_data = bytearray()
+            for _ in range(self.vad_frame_size):
+                if self.audio_buffer:
+                    frame_data.append(self.audio_buffer.popleft())
+                    self.buffer_count -= 1
+
+            # 确保帧大小正确
+            if len(frame_data) != self.vad_frame_size:
+                print(f"帧大小不正确: {len(frame_data)} != {self.vad_frame_size}")
+                return None
+
+            # 判断当前帧是否是语音
+            try:
+                is_speech = self.vad.is_speech(bytes(frame_data), self.RATE)
+            except Exception as e:
+                print(f"VAD 处理错误: {e}")
+                print(f"帧大小: {len(frame_data)}, 采样率: {self.RATE}")
+                return None
+
+            # 语音活动检测逻辑
+            if is_speech:
+                self.vad_active_frames += 1
+                self.vad_inactive_frames = 0
+                if self.vad_active_frames >= 3:  # 连续3帧检测到语音才开始记录
+                    self.speech_started = True
+                    print("检测到语音开始")
+            else:
+                self.vad_inactive_frames += 1
+                self.vad_active_frames = 0
+                
+            # 如果已经开始检测到语音，将数据添加到语音缓冲区
+            if self.speech_started:
+                self.speech_buffer.extend(frame_data)
+                
+            # 检查是否需要结束当前语音段
+            if self.speech_started and self.vad_inactive_frames >= 15:  # 连续15帧未检测到语音则认为语音结束
+                print("检测到语音结束")
+                self.speech_started = False
+                speech_data = bytes(self.speech_buffer)
+                self.speech_buffer.clear()
+                self.vad_active_frames = 0
+                self.vad_inactive_frames = 0
+                
+                # 检查语音长度是否足够
+                if len(speech_data) > self.RATE * 2:  # 至少1秒的语音 (16-bit = 2 bytes per sample)
+                    return speech_data
+                    
             return None
-        
-        # 从缓冲区提取数据
-        data = bytearray()
-        for _ in range(self.PROCESS_SIZE):
-            if self.audio_buffer:
-                data.append(self.audio_buffer.popleft())
-                self.buffer_count -= 1
-        
-        # 将字节数据转换为16位整数数组
-        audio_array = np.frombuffer(bytes(data), dtype=np.int16)
-        
-        # 计算音频能量
-        energy = np.mean(np.abs(audio_array))
-        
-        # 根据波形图设置合适的阈值
-        SPEECH_THRESHOLD = 100  # 有声音的阈值
-        SILENCE_THRESHOLD = 20  # 静音阈值
-        
-        # 检测语音状态
-        if energy > SPEECH_THRESHOLD:
-            # 检测到说话
-            self.is_speaking = True
-            self.silence_frames = 0
-            self.audio_buffer.clear()
-            self.buffer_count = 0
-            return bytes(data)
-        elif energy < SILENCE_THRESHOLD:
-            # 检测到静音
-            if self.is_speaking:
-                # 如果之前在说话，开始计数静音帧
-                self.silence_frames += 1
-                # 连续0.5秒静音认为说话结束（8000采样率下约4帧）
-                if self.silence_frames > 4:
-                    self.is_speaking = False
-                    self.silence_frames = 0
-                    return bytes(data)  # 返回最后一帧
-            return None
-        else:
-            # 能量在两个阈值之间，保持当前状态
-            if self.is_speaking:
-                self.silence_frames = 0
-                return bytes(data)
+
+        except Exception as e:
+            print(f"处理音频数据时发生错误: {e}")
             return None
 
     async def process_audio_loop(self):
@@ -339,29 +365,15 @@ class AudioChatServer:
             try:
                 # 获取要处理的数据
                 process_data = self.get_process_data()
-                print("data_send_complete: ", self.data_send_complete)
+                if not self.data_send_complete:
+                    self.audio_buffer.clear()
+                    self.buffer_count = 0
+                if self.data_send_complete_last != self.data_send_complete:
+                    print("data_send_complete: ", self.data_send_complete)
+                self.data_send_complete_last = self.data_send_complete
                 if process_data and self.data_send_complete:
-                    print("start process audio")
-                    # 保存音频数据为WAV文件
-                    # timestamp = int(time.time())
-                    # filename = f"debug_audio_{timestamp}.wav"
-                    # self.save_wav(process_data, filename)
+                    print(f"检测到语音片段，长度: {len(process_data)} 字节")
                     
-                    # 播放音频数据
-                    try:
-                        playback_stream = self.audio.open(
-                            format=self.FORMAT,
-                            channels=self.CHANNELS,
-                            rate=self.RATE,
-                            output=True
-                        )
-                        playback_stream.write(process_data)
-                        playback_stream.stop_stream()
-                        playback_stream.close()
-                        print(f"音频数据长度: {len(process_data)} 字节")
-                    except Exception as e:
-                        print(f"播放音频时出错: {e}")
-
                     # 原有的处理逻辑
                     text = self.speech_to_text(process_data)
                     if text:
@@ -374,7 +386,7 @@ class AudioChatServer:
                         if audio_data:
                             await self.send_queue.put(audio_data)
 
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.01)  # 缩短检测间隔，提高响应速度
 
             except Exception as e:
                 print(f"处理音频数据错误: {e}")
