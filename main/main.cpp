@@ -22,6 +22,9 @@
 #define MONITOR_INTERVAL_MS 5000
 #define MAX_PACKET_SIZE 150  // 适当调整包大小
 #define OPUS_FRAME_SIZE 960  // 与服务器编码帧大小保持一致
+#define AUDIO_BUFFER_SIZE (64 * 1024)
+#define ENCODED_PACKETS_BUFFER_SIZE 64
+#define DECODED_PACKETS_BUFFER_SIZE 35
 
 static const char *TAG = "MAIN";
 
@@ -106,15 +109,10 @@ typedef struct {
     SemaphoreHandle_t data_ready;
 } encoded_packets_buffer_t;
 
-// 在全局变量部分
+// ring buffer
 static audio_ring_buffer_t audio_ring_buffer;
 static decoded_packets_buffer_t decoded_packets_buffer;
 static encoded_packets_buffer_t encoded_packets_buffer;
-
-// 初始化环形缓冲区
-static uint8_t audio_buffer[32768];        // 32KB音频输出缓冲区
-static packet_data_t encoded_packets[20];  // 存储20个编码后的数据包
-static packet_data_t decoded_packets[35];  // 存储35个待解码的数据包
 
 // CPU使用率计算所需的变量
 static uint32_t prev_idle_ticks[2] = {0, 0};
@@ -448,13 +446,12 @@ static void audio_output_task(void *parameter)
 {
     static audio_data_t output_data = {};
     size_t bytes_written;
-    max98357_open();
 
     while (1) {
         // 等待解码数据就绪
         if (xSemaphoreTake(audio_ring_buffer.data_ready, portMAX_DELAY) == pdTRUE) {
             // 持续读取并输出数据，直到缓冲区为空
-            
+            max98357_open();
             while (1) {
                 size_t read_size = 0;
                 
@@ -484,6 +481,8 @@ static void audio_output_task(void *parameter)
                     ESP_LOGE(TAG, "Error writing I2S data");
                 }
             }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            max98357_close();
         }
     }
 }
@@ -572,12 +571,8 @@ static void audio_encode_task(void *parameter)
                 continue;
             }
             // 编码
-            uint64_t start_time = esp_timer_get_time();
             int encoded_size = opus_encode(encoder, inputData.buffer, OPUS_FRAME_SIZE, 
                                         packet_data.data, sizeof(packet_data.data));
-            uint64_t end_time = esp_timer_get_time();
-            ESP_LOGI(TAG, "Encoding time: %llu microseconds", end_time - start_time);
-
             if (encoded_size < 0) {
                 ESP_LOGE(TAG, "Opus编码错误: %d", encoded_size);
                 continue;
@@ -635,13 +630,15 @@ static void audio_decode_task(void *parameter) {
                     decoded_data.size = frame_size * 2;  // 16位采样，所以乘2
                     // 写入解码数据环形缓冲区
                     if (xSemaphoreTake(audio_ring_buffer.mutex, portMAX_DELAY) == pdTRUE) {
-                        audio_ring_buffer_write(&audio_ring_buffer, 
+                        size_t write_size = audio_ring_buffer_write(&audio_ring_buffer, 
                                         (uint8_t*)decoded_data.buffer, 
                                         decoded_data.size);
+                        if (write_size < 0) {
+                            ESP_LOGE(TAG, "audio output ring buffer full");
+                        }
                         xSemaphoreGive(audio_ring_buffer.mutex);
                         xSemaphoreGive(audio_ring_buffer.data_ready);
                     }
-                    // ESP_LOGI(TAG, "decode success: %d", frame_size);
                 } else {
                     ESP_LOGE(TAG, "decode error: %s", opus_strerror(frame_size));
                 }
@@ -731,9 +728,9 @@ static void websocket_send_task(void *parameter)
                                             ws_send_buffer.current_size,
                                             portMAX_DELAY);
                 
-                ESP_LOGI(TAG, "Sent final buffer: size=%d, packets=%d", 
-                        ws_send_buffer.current_size,
-                        ws_send_buffer.packet_count);
+                // ESP_LOGI(TAG, "Sent final buffer: size=%d, packets=%d", 
+                //         ws_send_buffer.current_size,
+                //         ws_send_buffer.packet_count);
 
                 // 重置发送缓冲区
                 ws_send_buffer.current_size = sizeof(packet_header_t);
@@ -751,6 +748,35 @@ void app_main(void)
 {
     // 初始化日志
     ESP_LOGI(TAG, "Starting application...");
+
+    // 检查PSRAM
+    size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    if (psram_size == 0) {
+        ESP_LOGE(TAG, "PSRAM not found or not initialized!");
+        return;
+    }
+    ESP_LOGI(TAG, "PSRAM initialized in Octal mode");
+    ESP_LOGI(TAG, "PSRAM size: %d bytes", psram_size);
+
+    // 分配大型缓冲区到PSRAM
+    uint8_t *audio_buffer = (uint8_t *)heap_caps_malloc(AUDIO_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    packet_data_t *encoded_packets = (packet_data_t *)heap_caps_malloc(
+        ENCODED_PACKETS_BUFFER_SIZE * sizeof(packet_data_t), 
+        MALLOC_CAP_SPIRAM
+    );
+    packet_data_t *decoded_packets = (packet_data_t *)heap_caps_malloc(
+        DECODED_PACKETS_BUFFER_SIZE * sizeof(packet_data_t), 
+        MALLOC_CAP_SPIRAM
+    );
+
+    if (!audio_buffer || !encoded_packets || !decoded_packets) {
+        ESP_LOGE(TAG, "Failed to allocate buffers in PSRAM");
+        // 清理已分配的内存
+        if (audio_buffer) heap_caps_free(audio_buffer);
+        if (encoded_packets) heap_caps_free(encoded_packets);
+        if (decoded_packets) heap_caps_free(decoded_packets);
+        return;
+    }
 
     // 初始化 WiFi
     wifi_init();
@@ -770,10 +796,16 @@ void app_main(void)
     audioEncodeQueue = xQueueCreate(5, sizeof(audio_data_t));
 
     // 初始化缓冲区
-    decoded_packets_buffer_init(&decoded_packets_buffer, decoded_packets, 35);
-    audio_ring_buffer_init(&audio_ring_buffer, audio_buffer, sizeof(audio_buffer));
-    encoded_packets_buffer_init(&encoded_packets_buffer, encoded_packets, 20);
-    
+    audio_ring_buffer_init(&audio_ring_buffer, audio_buffer, AUDIO_BUFFER_SIZE);
+    encoded_packets_buffer_init(&encoded_packets_buffer, encoded_packets, ENCODED_PACKETS_BUFFER_SIZE);
+    decoded_packets_buffer_init(&decoded_packets_buffer, decoded_packets, DECODED_PACKETS_BUFFER_SIZE);
+
+    // 打印内存使用情况
+    ESP_LOGI(TAG, "DRAM free: %d bytes", 
+        heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "PSRAM free: %d bytes", 
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
     // 初始化发送缓冲区
     ws_send_buffer.current_size = sizeof(packet_header_t);
     ws_send_buffer.packet_count = 0;
@@ -801,7 +833,14 @@ void app_main(void)
     }
 
     // 创建编码任务
-    xReturned = xTaskCreatePinnedToCore(audio_encode_task, "AudioEncode", 32768, NULL, 4, NULL, 1);
+    xReturned = xTaskCreatePinnedToCore(
+        audio_encode_task,
+        "AudioEncode",
+        32 * 1024 / sizeof(StackType_t),  // 保持32K栈大小
+        NULL,
+        5,
+        NULL,
+        1);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio encode task");
     }
@@ -836,6 +875,17 @@ void app_main(void)
     );
 
     ESP_LOGI(TAG, "All tasks created successfully");
+}
+
+// 添加资源清理函数（可以在需要时调用）
+static void cleanup_resources(void)
+{
+    if (audio_ring_buffer.buffer)
+        heap_caps_free(audio_ring_buffer.buffer);
+    if (encoded_packets_buffer.packets)
+        heap_caps_free(encoded_packets_buffer.packets);
+    if (decoded_packets_buffer.packets)
+        heap_caps_free(decoded_packets_buffer.packets);
 }
 
 #ifdef __cplusplus

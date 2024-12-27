@@ -7,11 +7,15 @@ import time
 from audio_codec import AudioCodec
 import threading
 import struct
+import pyaudio
+from openai import OpenAI
+import os
+import wave  # 添加到文件顶部的导入语句中
 
 class AudioPacketManager:
     def __init__(self):
         self.MAX_PACKET_SIZE = 150     # 每个数据包的最大大小
-        self.MAX_SEND_SIZE = 1024      # 每次发送的最大字节数
+        self.MAX_SEND_SIZE = 512      # 每次发送的最大字节数
         
         # 使用 =表示原生字节序，不进行对齐
         self.HEADER_FORMAT = '=IH'     # total_length(4) + total_packets(2)
@@ -100,13 +104,25 @@ class AudioChatServer:
         self.API_KEY = 'ibrjXDUQ6FgjrvSQJ4GANDBA'
         self.SECRET_KEY = '0xZe4laRgQbZrxAECCcKqeRZ1R8j3Jq1'
         self.baidu_client = AipSpeech(self.APP_ID, self.API_KEY, self.SECRET_KEY)
+    
+        # 音频配置
+        self.CHUNK = 1024
+        self.FORMAT = pyaudio.paInt16
+        self.CHANNELS = 1
+        self.RATE = 16000
         
+        # 初始化 PyAudio
+        self.audio = pyaudio.PyAudio()
+        self.stream = None
+        
+        # 初始化音频编解码器
+        self.audio_codec = AudioCodec()
         # 循环缓冲区配置
         self.BUFFER_SECONDS = 10
         self.SAMPLE_RATE = 16000
         self.BYTES_PER_SAMPLE = 2
         self.BUFFER_SIZE = self.SAMPLE_RATE * self.BYTES_PER_SAMPLE * self.BUFFER_SECONDS
-        self.PROCESS_SIZE = 64000  # 处理单位大小(约2秒的数据)
+        self.PROCESS_SIZE = 128000  # 处理单位大小(约2秒的数据)
         
         # 初始化循环缓冲区
         self.audio_buffer = deque(maxlen=self.BUFFER_SIZE)
@@ -125,90 +141,94 @@ class AudioChatServer:
         # 分包大小
         self.PACKET_SIZE = 1024
 
+        # 录音状态控制
+        self.is_recording = False
+        self.recording_thread = None
+
         # 添加锁
         self.buffer_lock = threading.Lock()
-
+        
         # 语音状态
         self.is_speaking = False
         self.silence_frames = 0
 
+        # 数据发送完成
+        self.data_send_complete = True
+        
         self.packet_manager = AudioPacketManager()
 
+        # 初始化火山云客户端
+        self.llm_client = OpenAI(
+            api_key=os.environ.get("ARK_API_KEY"),
+            base_url="https://ark.cn-beijing.volces.com/api/v3"
+        )
+        self.model_id = "ep-20241226171735-z9tvd"
+
+    def start_recording(self):
+        """开始录音"""
+        if self.is_recording:
+            return
+            
+        self.stream = self.audio.open(
+            format=self.FORMAT,
+            channels=self.CHANNELS,
+            rate=self.RATE,
+            input=True,
+            frames_per_buffer=self.CHUNK
+        )
+        
+        self.is_recording = True
+        self.recording_thread = threading.Thread(target=self._record_audio)
+        self.recording_thread.start()
+        print("开始录音...")
+
+    def stop_recording(self):
+        """停止录音"""
+        self.is_recording = False
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        if self.recording_thread:
+            self.recording_thread.join()
+        print("停止录音...")
+
+    def _record_audio(self):
+        """录音线程"""
+        while self.is_recording:
+            if self.data_send_complete:
+                # print("record data_send_complete: ", self.data_send_complete)
+                try:
+                    # 读取音频数据
+                    audio_data = self.stream.read(self.CHUNK)
+                    # 转换为numpy数组
+                    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                    
+                    # 更新缓冲区
+                    with self.buffer_lock:
+                        self.update_buffer(audio_array.tobytes())
+
+                except Exception as e:
+                    print(f"录音错误: {e}")
+                    break
+
     async def handle_websocket(self, websocket):
+        """处理WebSocket连接"""
         print("新客户端连接!")
         
         # 启动发送协程
         send_task = asyncio.create_task(self.send_worker(websocket))
         # 启动处理音频的循环
         process_task = asyncio.create_task(self.process_audio_loop())
-
+        
+        self.start_recording()
+        
         try:
-            async for message in websocket:
-                try:
-                    if isinstance(message, bytes):
-                        # 解析数据包头部
-                        if len(message) < struct.calcsize('=IH'):  # 4字节总长度 + 2字节包数量
-                            print("数据包太小，无法包含头部")
-                            continue
-
-                        # 如果是新的数据包，解析头部
-                        if self.current_packet is None:
-                            total_length, total_packets = struct.unpack('=IH', message[:6])
-                            self.current_packet = {
-                                'total_length': total_length,
-                                'total_packets': total_packets,
-                                'received_data': []
-                            }
-                            # 保存第一个包的数据部分
-                            self.current_packet['received_data'].append(message[6:])
-                        else:
-                            # 继续添加数据到当前包
-                            self.current_packet['received_data'].append(message)
-
-                        # 检查是否收集完整个数据包
-                        total_received = sum(len(data) for data in self.current_packet['received_data'])
-                        if total_received >= self.current_packet['total_length']:
-                            # 组合完整的数据包
-                            complete_data = b''.join(self.current_packet['received_data'])
-                            
-                            # 解析数据包成多个小包
-                            current_pos = 0
-                            packets = []
-                            for _ in range(self.current_packet['total_packets']):
-                                if current_pos + 2 > len(complete_data):  # 确保至少有长度字段
-                                    break
-                                    
-                                # 读取数据长度
-                                data_length = struct.unpack('=H', complete_data[current_pos:current_pos + 2])[0]
-                                current_pos += 2
-                                
-                                if current_pos + data_length > len(complete_data):  # 确保有足够的数据
-                                    break
-                                    
-                                # 提取数据
-                                data = complete_data[current_pos:current_pos + data_length]
-                                current_pos += data_length
-                                
-                                # 将小包添加到列表
-                                packets.append(data)
-                            
-                            # 将解析后的小包列表添加到处理队列
-                            if packets:
-                                with self.buffer_lock:
-                                    self.raw_buffer.extend(packets)
-                                print(f"解析完成: 共{len(packets)}个数据包")
-                            
-                            # 重置当前包状态
-                            self.current_packet = None
-
-                except Exception as e:
-                    print(f"处理消息错误: {e}")
-                    self.current_packet = None  # 出错时重置状态
-                    continue
-
+            async for _ in websocket:  # 保持连接活跃
+                pass
         except websockets.exceptions.ConnectionClosed:
             print("客户端断开连接")
         finally:
+            self.stop_recording()
             send_task.cancel()
             process_task.cancel()
             try:
@@ -235,13 +255,17 @@ class AudioChatServer:
             
             # 分割成适合发送的小包
             send_packets = self.packet_manager.split_packets(packed_data)
-            
+
+            self.data_send_complete = False
             # 发送所有分割后的数据包
             for i, packet in enumerate(send_packets):
                 await websocket.send(packet)
                 print(f"发送分包 {i+1}/{len(send_packets)}: {len(packet)} 字节")
-                await asyncio.sleep(0.4)  # 短暂延迟，避免发送过快
+                await asyncio.sleep(0.3)  # 短暂延迟，避免发送过快
 
+            # 等待2秒，确保数据发送完成，音频播放完成
+            await asyncio.sleep(2)
+            self.data_send_complete = True
             print(f"完成发送: 总包数={len(send_packets)}, 原始数据大小={len(packed_data)}字节")
 
         except websockets.exceptions.ConnectionClosed as e:
@@ -305,45 +329,47 @@ class AudioChatServer:
         """定期处理音频数据的循环"""
         while True:
             try:
-                encoded_packets = []
-                # 使用锁保护raw_buffer的读取
-                with self.buffer_lock:
-                    while self.raw_buffer:
-                        encoded_packets.append(self.raw_buffer.popleft())
+                # 获取要处理的数据
+                process_data = self.get_process_data()
+                print("data_send_complete: ", self.data_send_complete)
+                if process_data and self.data_send_complete:
+                    print("start process audio")
+                    # 保存音频数据为WAV文件
+                    # timestamp = int(time.time())
+                    # filename = f"debug_audio_{timestamp}.wav"
+                    # self.save_wav(process_data, filename)
+                    
+                    # 播放音频数据
+                    try:
+                        playback_stream = self.audio.open(
+                            format=self.FORMAT,
+                            channels=self.CHANNELS,
+                            rate=self.RATE,
+                            output=True
+                        )
+                        playback_stream.write(process_data)
+                        playback_stream.stop_stream()
+                        playback_stream.close()
+                        print(f"音频数据长度: {len(process_data)} 字节")
+                    except Exception as e:
+                        print(f"播放音频时出错: {e}")
 
-                if encoded_packets:
-                    # 分别解码每个小包，并将结果合并
-                    all_decoded_data = []
-                    for packet in encoded_packets:
-                        decoded_data, _ = self.audio_codec.decode_audio([packet])
-                        if len(decoded_data) > 0:
-                            all_decoded_data.append(decoded_data)
-
-                    if all_decoded_data:
-                        # 合并所有解码后的数据
-                        final_decoded_data = np.concatenate(all_decoded_data)
-                        # 更新缓冲区
-                        self.update_buffer(final_decoded_data.tobytes())
-
-                        # 获取要处理的数据
-                        process_data = self.get_process_data()
-                        if process_data:
-                            self.save_pcm(process_data, f"server/audio_files/audio_{time.time()}.pcm")
-                            # 检测到语音，进行处理
-                            # text = self.speech_to_text(process_data)
-                            # if text:
-                                # print(f"识别到的文字: {text}")
-                                # 处理响应
-                            response_text = "李梦丽"
-                            print(f"回复: {response_text}")
-                            audio_data = self.read_audio("server/audio_files/beijingkejiguan.pcm")
+                    # 原有的处理逻辑
+                    text = self.speech_to_text(process_data)
+                    if text:
+                        print(f"识别到的文字: {text}")
+                        # 调用大语言模型获取回复
+                        response_text = await self.get_llm_response(text)
+                        print(f"AI回复: {response_text}")
+                        # 文字转语音
+                        audio_data = self.text_to_speech(response_text)
+                        if audio_data:
                             await self.send_queue.put(audio_data)
 
-                await asyncio.sleep(5)  # 短暂延迟，避免CPU占用过高
+                await asyncio.sleep(0.5)
 
             except Exception as e:
                 print(f"处理音频数据错误: {e}")
-                self.is_processing = False
                 await asyncio.sleep(1)
 
     async def send_worker(self, websocket):
@@ -387,14 +413,27 @@ class AudioChatServer:
             f.write(audio_data)
         print(f"PCM音频已保存到: {filename}")
 
+    def save_wav(self, audio_data, filename):
+        """保存WAV格式音频文件"""
+        try:
+            with wave.open(filename, 'wb') as wav_file:
+                wav_file.setnchannels(self.CHANNELS)
+                wav_file.setsampwidth(self.audio.get_sample_size(self.FORMAT))
+                wav_file.setframerate(self.RATE)
+                wav_file.writeframes(audio_data)
+            print(f"WAV音频已保存到: {filename}")
+        except Exception as e:
+            print(f"保存WAV文件时出错: {e}")
+
+
     def text_to_speech(self, text):
         """文字转语音"""
         try:
             result = self.baidu_client.synthesis(text, 'zh', 1, {
                 'spd': 5,  # 语速，取值0-15
                 'pit': 5,  # 音调，取值0-15
-                'vol': 5,  # 音量，取值0-15
-                'per': 0,  # 发音人，0为女声，1为男声，3为情感男声，4为情感女声
+                'vol': 3,  # 音量，取值0-15
+                'per': 1,  # 发音人，0为女声，1为男声，3为情感男声，4为情感女声
                 'aue': 6,  # 返回PCM格式音频
             })
             
@@ -415,16 +454,40 @@ class AudioChatServer:
         with open(filename, 'rb') as f:
             return f.read()  # 返回字节数据
 
+    def cleanup(self):
+        """清理资源"""
+        self.stop_recording()
+        self.audio.terminate()
+
+    async def get_llm_response(self, text):
+        """调用火山云大语言模型获取回复"""
+        try:
+            completion = self.llm_client.chat.completions.create(
+                model=self.model_id,
+                messages=[
+                    {"role": "system", "content": "你是一个智能助手，请用简短的语言回答问题。"},
+                    {"role": "user", "content": text}
+                ]
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            print(f"调用大语言模型出错: {e}")
+            return "抱歉，我现在无法回答这个问题。"
+
 async def main():
     server = AudioChatServer()
-    # 创建websocket服务器
-    async with websockets.serve(
-        lambda websocket, path: server.handle_websocket(websocket) if path == "/ws/esp32-client" else None,
-        "0.0.0.0", 
-        80
-    ):
-        print("WebSocket server started on ws://0.0.0.0:80/ws/esp32-client")
-        await asyncio.Future()  # 运行直到被中断
+    try:
+        async with websockets.serve(
+            server.handle_websocket,  # 直接使用 handle_websocket 方法
+            "0.0.0.0", 
+            80,
+            # 如果需要路径过滤，使用 process_request
+            process_request=lambda path, request_headers: None if path == "/ws/esp32-client" else (404, [], b"Not Found")
+        ):
+            print("WebSocket server started on ws://0.0.0.0:80/ws/esp32-client")
+            await asyncio.Future()
+    finally:
+        server.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())
