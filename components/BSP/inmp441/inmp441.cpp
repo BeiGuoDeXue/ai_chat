@@ -5,6 +5,8 @@
 
 static const char *TAG = "INMP441";
 
+// TODO: i2s使用i2s_std库
+
 // I2S驱动配置结构体
 i2s_config_t inmp441_i2s_config = {
     .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),              // 主模式 + 接收模式
@@ -13,8 +15,8 @@ i2s_config_t inmp441_i2s_config = {
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,                    // 仅使用左声道
     .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S), // I2S标准通信格式
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,                       // 中断优先级设置
-    .dma_buf_count = 8,                                             // DMA缓冲区数量
-    .dma_buf_len = 128,                                             // 每个DMA缓冲区长度
+    .dma_buf_count = 4,                                             // DMA缓冲区数量
+    .dma_buf_len = 960,                                             // 每个DMA缓冲区长度
     .use_apll = false                                               // 不使用APLL
 };
 

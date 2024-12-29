@@ -10,10 +10,15 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// I2S 引脚定义
-#define INMP441_WS  4    // Word Select (WS) 引脚，也称为 LRCLK
-#define INMP441_SCK 5    // Serial Clock (SCK) 引脚，也称为 BCLK
-#define INMP441_SD  6    // Serial Data (SD) 引脚，用于数据输入
+// // I2S 引脚定义
+// #define INMP441_WS  4    // Word Select (WS) 引脚，也称为 LRCLK
+// #define INMP441_SCK 5    // Serial Clock (SCK) 引脚，也称为 BCLK
+// #define INMP441_SD  6    // Serial Data (SD) 引脚，用于数据输入
+
+#define INMP441_SCK 9  // 时钟
+#define INMP441_SD  10  // 数据
+#define INMP441_WS  14  // 字选择
+
 
 // 采样率设置（Hz）
 #define INMP441_SAMPLE_RATE 16000

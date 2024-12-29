@@ -13,6 +13,9 @@ import wave  # 添加到文件顶部的导入语句中
 from llm.zhipu_client import ZhipuClient
 from llm.volcengine_client import VolcengineClient
 import webrtcvad
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class AudioPacketManager:
     def __init__(self):
@@ -277,10 +280,16 @@ class AudioChatServer:
             send_packets = self.packet_manager.split_packets(packed_data)
 
             self.data_send_complete = False
+            send_time_last = time.time()
             # 发送所有分割后的数据包
             for i, packet in enumerate(send_packets):
                 await websocket.send(packet)
                 print(f"发送分包 {i+1}/{len(send_packets)}: {len(packet)} 字节")
+                send_time = time.time()
+                print(f"send_time_diff: {send_time - send_time_last}")
+                send_time_last = send_time
+                if send_time - send_time_last > 0.3 * 2:
+                    print("time diff too long")
                 await asyncio.sleep(0.3)  # 短暂延迟，避免发送过快
 
             # 等待2秒，确保数据发送完成，音频播放完成

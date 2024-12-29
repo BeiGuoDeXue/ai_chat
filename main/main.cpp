@@ -114,15 +114,13 @@ static audio_ring_buffer_t audio_ring_buffer;
 static decoded_packets_buffer_t decoded_packets_buffer;
 static encoded_packets_buffer_t encoded_packets_buffer;
 
-// CPU使用率计算所需的变量
-static uint32_t prev_idle_ticks[2] = {0, 0};
-static uint32_t prev_total_ticks[2] = {0, 0};
-
 // 监控任务
-void monitor_task(void* arg)
+static void monitor_task(void* arg)
 {
+    char *task_stats_buffer = (char*)malloc(2048);
+    
     while(1) {
-        // 1. 内存使用情况
+        // 内存使用情况监控
         multi_heap_info_t heap_info;
         heap_caps_get_info(&heap_info, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         
@@ -136,66 +134,48 @@ void monitor_task(void* arg)
         ESP_LOGI(TAG, "Minimum Free Heap: %ld bytes", min_free_heap);
         ESP_LOGI(TAG, "Largest Free Block: %u", heap_info.largest_free_block);
         
-        // 2. 获取运行时间
-        uint64_t current_time = esp_timer_get_time() / 1000000; // 转换为秒
-        ESP_LOGI(TAG, "System uptime: %llu seconds", current_time);
-        
-        // 3. 获取空闲任务的运行时间来估算CPU使用率
-        UBaseType_t idle0_priority = uxTaskPriorityGet(xTaskGetIdleTaskHandle());
-        UBaseType_t idle1_priority = uxTaskPriorityGet(xTaskGetIdleTaskHandleForCPU(1));
-        
-        ESP_LOGI(TAG, "\nTask Info:");
-        ESP_LOGI(TAG, "IDLE0 Priority: %u", idle0_priority);
-        ESP_LOGI(TAG, "IDLE1 Priority: %u", idle1_priority);
-        
-        // 4. 获取堆栈高水位线
-        UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
-        ESP_LOGI(TAG, "Current Task Stack Watermark: %u", watermark);
-        
-        // 5. 获取空闲堆大小
-        size_t free_heap_size = xPortGetFreeHeapSize();
-        size_t min_free_heap_size = xPortGetMinimumEverFreeHeapSize();
-        ESP_LOGI(TAG, "Current Free Heap: %u bytes", free_heap_size);
-        ESP_LOGI(TAG, "Minimum Ever Free Heap: %u bytes", min_free_heap_size);
+        // 系统运行时间
+        ESP_LOGI(TAG, "System uptime: %llu seconds", esp_timer_get_time() / 1000000);
         
         // CPU使用率监控
-        uint32_t current_idle0 = ulTaskGetIdleRunTimeCounter(); // Core 0空闲计数
-        uint32_t current_idle1 = ulTaskGetIdleRunTimeCounter(); // Core 1空闲计数
+        if (task_stats_buffer) {
+            vTaskGetRunTimeStats(task_stats_buffer);
+            ESP_LOGI(TAG, "Raw stats:\n%s", task_stats_buffer);
+            
+            float cpu_usage_0 = 0.0f;
+            float cpu_usage_1 = 0.0f;
+            
+            // 解析原始数据中显示的百分比
+            char *line = strtok(task_stats_buffer, "\n");
+            while (line != NULL) {
+                char task_name[32] = {0};
+                uint32_t abs_time = 0;
+                float percentage = 0.0f;
+                
+                // 尝试解析包含百分比的行
+                if (sscanf(line, "%31s %lu %f%%", task_name, &abs_time, &percentage) >= 2) {
+                    if (strcmp(task_name, "IDLE0") == 0) {
+                        cpu_usage_0 = 100.0f - percentage;
+                        ESP_LOGI(TAG, "IDLE0 percentage: %.1f%%", percentage);
+                    } else if (strcmp(task_name, "IDLE1") == 0) {
+                        cpu_usage_1 = 100.0f - percentage;
+                        ESP_LOGI(TAG, "IDLE1 percentage: %.1f%%", percentage);
+                    }
+                }
+                line = strtok(NULL, "\n");
+            }
+            
+            // 确保结果在0-100范围内
+            cpu_usage_0 = (cpu_usage_0 < 0.0f) ? 0.0f : (cpu_usage_0 > 100.0f) ? 100.0f : cpu_usage_0;
+            cpu_usage_1 = (cpu_usage_1 < 0.0f) ? 0.0f : (cpu_usage_1 > 100.0f) ? 100.0f : cpu_usage_1;
+            
+            ESP_LOGI(TAG, "CPU Usage - Core 0: %.1f%%, Core 1: %.1f%%", cpu_usage_0, cpu_usage_1);
+        }
         
-        // 获取总的运行时间
-        uint32_t total_ticks0 = esp_cpu_get_cycle_count(); // Core 0总计数
-        uint32_t total_ticks1 = esp_cpu_get_cycle_count(); // Core 1总计数
-
-        // 计算CPU使用率
-        float cpu_usage0 = 0;
-        float cpu_usage1 = 0;
-
-        if (prev_total_ticks[0] > 0) {
-            uint32_t idle_delta0 = current_idle0 - prev_idle_ticks[0];
-            uint32_t total_delta0 = total_ticks0 - prev_total_ticks[0];
-            if (total_delta0 > 0) {
-                cpu_usage0 = 100.0f * (1.0f - ((float)idle_delta0 / total_delta0));
-            }
-        }
-
-        if (prev_total_ticks[1] > 0) {
-            uint32_t idle_delta1 = current_idle1 - prev_idle_ticks[1];
-            uint32_t total_delta1 = total_ticks1 - prev_total_ticks[1];
-            if (total_delta1 > 0) {
-                cpu_usage1 = 100.0f * (1.0f - ((float)idle_delta1 / total_delta1));
-            }
-        }
-
-        // 更新上一次的计数
-        prev_idle_ticks[0] = current_idle0;
-        prev_idle_ticks[1] = current_idle1;
-        prev_total_ticks[0] = total_ticks0;
-        prev_total_ticks[1] = total_ticks1;
-
-        ESP_LOGI(TAG, "CPU Usage - Core 0: %.1f%%, Core 1: %.1f%%", cpu_usage0, cpu_usage1);
-
         vTaskDelay(pdMS_TO_TICKS(MONITOR_INTERVAL_MS));
     }
+    
+    free(task_stats_buffer);
 }
 
 // 初始化码数据环形缓冲区
@@ -415,29 +395,32 @@ static void audio_input_task(void *parameter)
     size_t bytes_read;
     
     while (1) {
+        // 读取一次数据（阻塞式）
         esp_err_t ret = read_mic_data(inputData.buffer, 
                                     sizeof(inputData.buffer), 
                                     &bytes_read);
+                                    
         if (ret == ESP_OK && bytes_read > 0) {
             inputData.size = bytes_read;
-            mic_data_handle(inputData.buffer, inputData.size);
+            // mic_data_handle(inputData.buffer, inputData.size);
 
             // 将数据写入队列
             if (xQueueSend(audioEncodeQueue, &inputData, 0) != pdPASS) {
                 ESP_LOGW(TAG, "Audio encode queue is full");
             }
-
             // if (xSemaphoreTake(audio_ring_buffer.mutex, portMAX_DELAY) == pdTRUE) {
-            //     audio_ring_buffer_write(&audio_ring_buffer, 
+            //     size_t write_size = audio_ring_buffer_write(&audio_ring_buffer, 
             //                     (uint8_t*)inputData.buffer, 
             //                     inputData.size);
+            //     if (write_size <= 0) {
+            //         ESP_LOGE(TAG, "audio output ring buffer full");
+            //     }
             //     xSemaphoreGive(audio_ring_buffer.mutex);
             //     xSemaphoreGive(audio_ring_buffer.data_ready);
             // }
         } else {
-            ESP_LOGE(TAG, "Read mic data error");
+            ESP_LOGE(TAG, "Read mic data error: %d", ret);
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -446,12 +429,12 @@ static void audio_output_task(void *parameter)
 {
     static audio_data_t output_data = {};
     size_t bytes_written;
-
+    max98357_open();
     while (1) {
         // 等待解码数据就绪
         if (xSemaphoreTake(audio_ring_buffer.data_ready, portMAX_DELAY) == pdTRUE) {
             // 持续读取并输出数据，直到缓冲区为空
-            max98357_open();
+            // max98357_open();
             while (1) {
                 size_t read_size = 0;
                 
@@ -470,8 +453,8 @@ static void audio_output_task(void *parameter)
                 }
 
                 output_data.size = read_size;
-                ESP_LOGI(TAG, "output data size: %d, ring buffer len: %d", 
-                        output_data.size, audio_ring_buffer.data_size);
+                // ESP_LOGI(TAG, "output data size: %d, ring buffer len: %d", 
+                //         output_data.size, audio_ring_buffer.data_size);
 
                 // 输出到喇叭
                 esp_err_t ret = write_max98357_data(output_data.buffer, 
@@ -481,8 +464,7 @@ static void audio_output_task(void *parameter)
                     ESP_LOGE(TAG, "Error writing I2S data");
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(10));
-            max98357_close();
+            // max98357_close();
         }
     }
 }
@@ -633,7 +615,7 @@ static void audio_decode_task(void *parameter) {
                         size_t write_size = audio_ring_buffer_write(&audio_ring_buffer, 
                                         (uint8_t*)decoded_data.buffer, 
                                         decoded_data.size);
-                        if (write_size < 0) {
+                        if (write_size <= 0) {
                             ESP_LOGE(TAG, "audio output ring buffer full");
                         }
                         xSemaphoreGive(audio_ring_buffer.mutex);

@@ -1,6 +1,8 @@
 import os
+from dotenv import load_dotenv
 from openai import OpenAI
 
+load_dotenv()
 client = OpenAI(
     api_key = os.environ.get("ARK_API_KEY"),
     base_url = "https://ark.cn-beijing.volces.com/api/v3",
@@ -14,6 +16,8 @@ completion = client.chat.completions.create(
         {"role": "system", "content": "你是豆包，是由字节跳动开发的 AI 人工智能助手"},
         {"role": "user", "content": "常见的十字花科植物有哪些？"},
     ],
+    n = 1,  # 只生成一个回答
+    max_tokens = 100  # 这里设置最大生成的token数，类似效果
 )
 print(completion.choices[0].message.content)
 
@@ -25,7 +29,9 @@ stream = client.chat.completions.create(
         {"role": "system", "content": "你是豆包，是由字节跳动开发的 AI 人工智能助手"},
         {"role": "user", "content": "常见的十字花科植物有哪些？"},
     ],
-    stream=True
+    stream=True,
+    n = 1,  # 只生成一个回答
+    max_tokens = 100  # 这里设置最大生成的token数，类似效果
 )
 
 for chunk in stream:

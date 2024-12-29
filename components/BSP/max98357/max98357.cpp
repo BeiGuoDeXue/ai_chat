@@ -16,8 +16,8 @@ i2s_config_t max98357_i2s_config = {
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,                          // 仅使用左声道
     .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_MSB), // 标准MSB格式
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,                             // 中断优先级设置
-    .dma_buf_count = 8,                                                   // DMA缓冲区数量
-    .dma_buf_len = 128                                                    // 每个DMA缓冲区长度
+    .dma_buf_count = 4,                                                   // DMA缓冲区数量
+    .dma_buf_len = 960                                                    // 每个DMA缓冲区长度
 };
 
 // I2S引脚配置
