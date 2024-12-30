@@ -9,4 +9,5 @@ idf_component_register(
              "78__esp-opus-encoder"
              "BSP"
              "78__esp-wifi-connect"
+             "json"
 )

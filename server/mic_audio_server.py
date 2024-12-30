@@ -14,93 +14,15 @@ from llm.zhipu_client import ZhipuClient
 from llm.volcengine_client import VolcengineClient
 import webrtcvad
 from dotenv import load_dotenv
+import json
+import base64
+import sys
+
+# 设置控制台输出编码
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
 
 load_dotenv()
-
-class AudioPacketManager:
-    def __init__(self):
-        self.MAX_PACKET_SIZE = 150     # 每个数据包的最大大小
-        self.MAX_SEND_SIZE = 512      # 每次发送的最大字节数
-        
-        # 使用 =表示原生字节序，不进行对齐
-        self.HEADER_FORMAT = '=IH'     # total_length(4) + total_packets(2)
-        self.DATA_HEADER_FORMAT = '=H'  # data_length(2)
-
-    def create_packet_header(self, total_length, total_packets):
-        """创建数据包头部"""
-        return struct.pack(self.HEADER_FORMAT, total_length, total_packets)
-
-    def create_data_packet(self, data):
-        """创建单个数据包"""
-        return struct.pack(self.DATA_HEADER_FORMAT, len(data)) + data
-
-    def pack_audio_data(self, encoded_packets):
-        """将多个编码包打包成一个完整的传输包"""
-        # 计算总长度（所有数据包的长度总和）
-        total_length = sum(len(packet) for packet in encoded_packets)
-        total_packets = len(encoded_packets)
-        
-        # 创建头部
-        header = self.create_packet_header(total_length, total_packets)
-        
-        # 创建数据包
-        data_packets = [self.create_data_packet(packet) for packet in encoded_packets]
-        
-        # 组合所有数据
-        return header + b''.join(data_packets)
-
-    def split_packets(self, packed_data):
-        """将大数据包分割成适合发送的小包，确保不破坏数据包结构
-        返回: 分割后的数据包列表
-        """
-        header_size = struct.calcsize('<IH')  # 头部大小: 4 + 2 = 6 字节
-        data_header_size = struct.calcsize('<H')  # 数据包头部大小: 2 字节
-        
-        # 如果总大小小于最大发送大小，直接返回
-        if len(packed_data) <= self.MAX_SEND_SIZE:
-            return [packed_data]
-        
-        # 提取原始头部信息
-        total_length, total_packets = struct.unpack('<IH', packed_data[:header_size])
-        
-        # 开始分割数据
-        result = []
-        current_pos = header_size
-        current_packets = []
-        current_length = 0
-        packet_count = 0
-        
-        while current_pos < len(packed_data):
-            # 读取数据包长度
-            data_length = struct.unpack('<H', packed_data[current_pos:current_pos + data_header_size])[0]
-            packet_total_size = data_header_size + data_length
-            
-            # 检查是否需要创建新的发送包
-            if current_length + packet_total_size > (self.MAX_SEND_SIZE - header_size) and current_packets:
-                # 创建新的发送包
-                sub_total_length = sum(len(p) for p in current_packets)
-                sub_header = struct.pack('<IH', sub_total_length, len(current_packets))
-                result.append(sub_header + b''.join(current_packets))
-                
-                # 重置当前包的状态
-                current_packets = []
-                current_length = 0
-            
-            # 添加当前数据包
-            current_packet = packed_data[current_pos:current_pos + packet_total_size]
-            current_packets.append(current_packet)
-            current_length += packet_total_size
-            packet_count += 1
-            
-            current_pos += packet_total_size
-        
-        # 处理最后一批数据包
-        if current_packets:
-            sub_total_length = sum(len(p) for p in current_packets)
-            sub_header = struct.pack('<IH', sub_total_length, len(current_packets))
-            result.append(sub_header + b''.join(current_packets))
-        
-        return result
 
 class AudioChatServer:
     def __init__(self):
@@ -160,8 +82,6 @@ class AudioChatServer:
         # 数据发送完成
         self.data_send_complete = True
         self.data_send_complete_last = False
-        
-        self.packet_manager = AudioPacketManager()
 
         # 初始化LLM客户端
         self.zhipu_client = ZhipuClient(
@@ -189,6 +109,9 @@ class AudioChatServer:
         self.vad_inactive_frames = 0  # 连续检测到静音的帧数
         self.speech_started = False  # 是否开始检测到语音
         self.speech_buffer = bytearray()  # 存储语音数据
+
+        # 初始化包序列号
+        self.sequence_id = 0
 
     def start_recording(self):
         """开始录音"""
@@ -261,44 +184,95 @@ class AudioChatServer:
                 pass
 
     async def send_audio_packets(self, websocket, audio_data):
-        """分包发送音频数据"""
+        """使用JSON格式发送音频数据"""
         try:
             if websocket.closed:
-                print("WebSocket连接已关闭，无法发送数据")
+                print("WebSocket未连接，无法发送数据")
                 return
             
-            # 将音频数据转换为numpy数组
+            # 1. 将音频数据编码成opus包
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
+            encoded_packets, _ = self.audio_codec.encode_audio(audio_array)
             
-            # 编码音频数据
-            encoded_packets, stats = self.audio_codec.encode_audio(audio_array)
+            # 2. 将数据包分批处理
+            current_batch = []
+            current_size = 0
+            batch_number = 0
             
-            # 打包所有数据
-            packed_data = self.packet_manager.pack_audio_data(encoded_packets)
-            
-            # 分割成适合发送的小包
-            send_packets = self.packet_manager.split_packets(packed_data)
+            for packet in encoded_packets:
+                # 计算当前包的JSON大小
+                packet_data = {
+                    "type": "audio",
+                    "sequence": self.sequence_id,
+                    "batch": batch_number,
+                    "data": base64.b64encode(packet).decode('utf-8'),
+                    "length": len(packet)
+                }
+                json_data = json.dumps(packet_data)
+                packet_size = len(json_data.encode('utf-8'))
+                
+                # 如果添加这个包会超过512字节，先发送当前批次
+                if current_size + packet_size > 1024 and current_batch:
+                    batch_data = {
+                        "type": "audio_batch",
+                        "sequence": self.sequence_id,
+                        "batch": batch_number,
+                        "total_packets": len(current_batch),
+                        "packets": current_batch
+                    }
+                    
+                    try:
+                        await websocket.send(json.dumps(batch_data))
+                        print(f"发送批次 {batch_number}: {len(current_batch)}个包, "
+                              f"sequence={self.sequence_id}, size={current_size}字节")
+                        
+                        # 重置当前批次
+                        current_batch = []
+                        current_size = 0
+                        batch_number += 1
+                        self.sequence_id += 1
+                        
+                        # 控制发送速率
+                        await asyncio.sleep(0.2)  # 50ms间隔
 
-            self.data_send_complete = False
-            send_time_last = time.time()
-            # 发送所有分割后的数据包
-            for i, packet in enumerate(send_packets):
-                await websocket.send(packet)
-                print(f"发送分包 {i+1}/{len(send_packets)}: {len(packet)} 字节")
-                send_time = time.time()
-                print(f"send_time_diff: {send_time - send_time_last}")
-                send_time_last = send_time
-                if send_time - send_time_last > 0.3 * 2:
-                    print("time diff too long")
-                await asyncio.sleep(0.3)  # 短暂延迟，避免发送过快
-
-            # 等待2秒，确保数据发送完成，音频播放完成
-            await asyncio.sleep(2)
+                    except websockets.exceptions.ConnectionClosed:
+                        print("WebSocket连接已关闭")
+                        return
+                    except Exception as e:
+                        print(f"发送数据包失败: {e}")
+                        continue
+                
+                # 添加当前包到批次
+                current_batch.append({
+                    "data": base64.b64encode(packet).decode('utf-8'),
+                    "length": len(packet)
+                })
+                current_size += packet_size
+            
+            # 发送最后一批（如果有）
+            if current_batch:
+                batch_data = {
+                    "type": "audio_batch",
+                    "sequence": self.sequence_id,
+                    "batch": batch_number,
+                    "total_packets": len(current_batch),
+                    "packets": current_batch
+                }
+                
+                try:
+                    await websocket.send(json.dumps(batch_data))
+                    print(f"发送最后批次 {batch_number}: {len(current_batch)}个包, "
+                          f"sequence={self.sequence_id}, size={current_size}字节")
+                    self.sequence_id += 1
+                    
+                except websockets.exceptions.ConnectionClosed:
+                    print("WebSocket连接已关闭")
+                except Exception as e:
+                    print(f"发送最后批次失败: {e}")
+            
+            await asyncio.sleep(0.1)  # 等待数据发送完成
             self.data_send_complete = True
-            print(f"完成发送: 总包数={len(send_packets)}, 原始数据大小={len(packed_data)}字节")
 
-        except websockets.exceptions.ConnectionClosed as e:
-            print(f"WebSocket连接关闭: {e}")
         except Exception as e:
             print(f"发送数据包错误: {e}")
 
@@ -372,30 +346,34 @@ class AudioChatServer:
         """定期处理音频数据的循环"""
         while True:
             try:
-                # 获取要处理的数据
-                process_data = self.get_process_data()
-                if not self.data_send_complete:
-                    self.audio_buffer.clear()
-                    self.buffer_count = 0
-                if self.data_send_complete_last != self.data_send_complete:
-                    print("data_send_complete: ", self.data_send_complete)
-                self.data_send_complete_last = self.data_send_complete
-                if process_data and self.data_send_complete:
-                    print(f"检测到语音片段，长度: {len(process_data)} 字节")
+                # # 获取要处理的数据
+                # process_data = self.get_process_data()
+                # if not self.data_send_complete:
+                #     self.audio_buffer.clear()
+                #     self.buffer_count = 0
+                # if self.data_send_complete_last != self.data_send_complete:
+                #     print("data_send_complete: ", self.data_send_complete)
+                # self.data_send_complete_last = self.data_send_complete
+                # if process_data and self.data_send_complete:
+                #     print(f"检测到语音片段，长度: {len(process_data)} 字节")
                     
-                    # 原有的处理逻辑
-                    text = self.speech_to_text(process_data)
-                    if text:
-                        print(f"识别到的文字: {text}")
-                        # 调用大语言模型获取回复
-                        response_text = await self.get_llm_response(text)
-                        print(f"AI回复: {response_text}")
-                        # 文字转语音
-                        audio_data = self.text_to_speech(response_text)
-                        if audio_data:
-                            await self.send_queue.put(audio_data)
+                #     # 原有的处理逻辑
+                #     text = self.speech_to_text(process_data)
+                #     if text:
+                #         print(f"识别到的文字: {text}")
+                #         # 调用大语言模型获取回复
+                #         response_text = await self.get_llm_response(text)
+                #         print(f"AI回复: {response_text}")
+                #         # 文字转语音
+                #         audio_data = self.text_to_speech(response_text)
+                #         if audio_data:
+                #             await self.send_queue.put(audio_data)
 
-                await asyncio.sleep(0.01)  # 缩短检测间隔，提高响应速度
+                audio_data = self.read_audio("../server/audio_files/pcm/qiufeng.pcm")
+                if audio_data:
+                    await self.send_queue.put(audio_data)
+
+                await asyncio.sleep(6)  # 缩短检测间隔，提高响应速度
 
             except Exception as e:
                 print(f"处理音频数据错误: {e}")
