@@ -56,4 +56,12 @@ esp_err_t max98357_close(void);
  */
 esp_err_t max98357_open(void);
 
+/**
+ * 处理MAX98357A的音频数据
+ * @param data_in 输入数据缓冲区
+ * @param bytes_read 数据字节数
+ * @param volume 音量
+ */
+void max98357_data_handle(int16_t *data_in, size_t bytes_read, float volume);
+
 #endif

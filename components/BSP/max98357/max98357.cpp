@@ -127,3 +127,15 @@ esp_err_t max98357_open(void)
 
     return gpio_set_level(MAX98357_SD_MODE_PIN, 1);
 }
+
+void max98357_data_handle(int16_t *data_in, size_t bytes_read, float volume) {
+    // 处理音频数据
+    int samples_read = bytes_read / 2; // 16位数据，每个样本2字节
+    for(int i = 0; i < samples_read; i++) {
+        // 2. 音量调节
+        data_in[i] = data_in[i] * volume;
+        // 3. 削波保护
+        if(data_in[i] > 32767) data_in[i] = 32767;
+        if(data_in[i] < -32767) data_in[i] = -32767;
+    }
+}

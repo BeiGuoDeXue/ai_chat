@@ -113,6 +113,11 @@ class AudioChatServer:
         # 初始化包序列号
         self.sequence_id = 0
 
+        # 添加流控制相关的属性
+        self.flow_control_paused = False
+        self.pause_event = asyncio.Event()
+        self.pause_event.set()  # 初始状态为未暂停
+
     def start_recording(self):
         """开始录音"""
         if self.is_recording:
@@ -169,8 +174,57 @@ class AudioChatServer:
         self.start_recording()
         
         try:
-            async for _ in websocket:  # 保持连接活跃
-                pass
+            async for message in websocket:
+                try:
+                    # 打印原始消息类型和长度以进行调试
+                    print(f"收到消息: 类型={type(message)}, 长度={len(message)}")
+                    
+                    # 如果是二进制数据，尝试直接解析JSON
+                    if isinstance(message, bytes):
+                        try:
+                            # 尝试直接解析二进制数据
+                            data = json.loads(message)
+                            if data.get('type') == 'flow_control':
+                                self.flow_control_paused = data.get('pause', False)
+                                if self.flow_control_paused:
+                                    self.pause_event.clear()
+                                    print("收到暂停请求")
+                                else:
+                                    self.pause_event.set()
+                                    print("收到恢复请求")
+                        except json.JSONDecodeError:
+                            # 如果直接解析失败，尝试不同的编码方式
+                            for encoding in ['utf-8', 'ascii', 'iso-8859-1']:
+                                try:
+                                    text = message.decode(encoding)
+                                    data = json.loads(text)
+                                    if data.get('type') == 'flow_control':
+                                        self.flow_control_paused = data.get('pause', False)
+                                        if self.flow_control_paused:
+                                            self.pause_event.clear()
+                                            print("收到暂停请求")
+                                        else:
+                                            self.pause_event.set()
+                                            print("收到恢复请求")
+                                    break
+                                except (UnicodeDecodeError, json.JSONDecodeError):
+                                    continue
+                    else:
+                        # 文本消息直接解析
+                        data = json.loads(message)
+                        if data.get('type') == 'flow_control':
+                            self.flow_control_paused = data.get('pause', False)
+                            if self.flow_control_paused:
+                                self.pause_event.clear()
+                                print("收到暂停请求")
+                            else:
+                                self.pause_event.set()
+                                print("收到恢复请求")
+                            
+                except Exception as e:
+                    print(f"处理消息时发生错误: {type(e).__name__}: {str(e)}")
+                    continue
+                
         except websockets.exceptions.ConnectionClosed:
             print("客户端断开连接")
         finally:
@@ -200,6 +254,9 @@ class AudioChatServer:
             batch_number = 0
             
             for packet in encoded_packets:
+                # 等待恢复发送信号
+                await self.pause_event.wait()
+                
                 # 计算当前包的JSON大小
                 packet_data = {
                     "type": "audio",
