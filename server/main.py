@@ -162,7 +162,7 @@ class AudioChatServer:
                             # 保存第一个包的数据部分
                             self.current_packet['received_data'].append(message[6:])
                         else:
-                            # 继续添加数据到当前包
+                                                        # 继续添加数据到当前包
                             self.current_packet['received_data'].append(message)
 
                         # 检查是否收集完整个数据包
@@ -170,7 +170,7 @@ class AudioChatServer:
                         if total_received >= self.current_packet['total_length']:
                             # 组合完整的数据包
                             complete_data = b''.join(self.current_packet['received_data'])
-                            
+
                             # 解析数据包成多个小包
                             current_pos = 0
                             packets = []

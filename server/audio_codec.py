@@ -7,7 +7,7 @@ from typing import Tuple, List, Optional
 class AudioCodec:
     def __init__(self):
         # 基本参数配置
-        self.FRAME_SIZE = 960  # 10ms at 16kHz
+        self.FRAME_SIZE = 960  # 60ms at 16kHz
         self.SAMPLE_RATE = 16000  # 16kHz
         self.CHANNELS = 1  # 单声道
 

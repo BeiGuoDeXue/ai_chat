@@ -37,7 +37,7 @@ def analyze_audio_energy(audio_data: bytes, sample_rate: int = 16000):
             plt.pause(0.001)
             
             # 保存图片
-            plt.savefig(f'audio_waveform_{int(time.time())}.png')
+            plt.savefig(f'server/audio_files/png/audio_waveform_{int(time.time())}.png')
             
         except Exception as e:
             print(f"绘制波形图错误: {e}")

@@ -24,11 +24,14 @@
 #define MAX_PACKET_SIZE 150  // 适当调整包大小
 #define OPUS_FRAME_SIZE 960  // 与服务器编码帧大小保持一致
 #define AUDIO_BUFFER_SIZE (32 * 1024)
-#define ENCODED_PACKETS_BUFFER_SIZE 10
+#define ENCODED_PACKETS_BUFFER_SIZE 64  // 64个包，由于网络卡顿，这里需要多一些
 #define DECODED_PACKETS_BUFFER_SIZE 64
 #define FLOW_CONTROL_THRESHOLD_HIGH 0.75  // 75%容量时发送暂停
 #define FLOW_CONTROL_THRESHOLD_LOW  0.25  // 25%容量时发送恢复
 #define FLOW_CONTROL_CHECK_INTERVAL_MS 100  // 每100ms检查一次缓冲区状态
+#define MAX_BATCH_SIZE 1024
+
+// #define TEST_MIC_AUDIO 1
 
 static const char *TAG = "MAIN";
 
@@ -55,6 +58,7 @@ static TaskHandle_t wsTaskHandle;
 // 全局变量
 static bool wsConnected = false;
 static bool flow_control_paused = false;
+static uint32_t sequence_id = 0;
 
 // 音频数据结构
 typedef struct {
@@ -97,13 +101,6 @@ typedef struct {
     SemaphoreHandle_t data_ready;
 } audio_ring_buffer_t;
 
-// 在全局变量部分添加
-static struct {
-    uint8_t buffer[1024];  // 足够大的缓冲区存储多个数据包
-    size_t current_size;   // 当前已存储的数据大小
-    uint16_t packet_count; // 当前包含的数据包数量
-} ws_send_buffer;
-
 // 在全局变量部分添加编码数据的ring buffer
 typedef struct {
     packet_data_t *packets;   // packet_data_t数组
@@ -119,13 +116,6 @@ typedef struct {
 static audio_ring_buffer_t audio_ring_buffer;
 static decoded_packets_buffer_t decoded_packets_buffer;
 static encoded_packets_buffer_t encoded_packets_buffer;
-
-// 添加到全局变量区域
-static struct {
-    uint8_t buffer[2048];  // 分片重组缓冲区
-    size_t size;           // 当前缓冲区大小
-    bool receiving;        // 是否正在接收分片
-} ws_recv_buffer = {0};
 
 // Base64解码表
 static const unsigned char base64_table[256] = {
@@ -172,6 +162,45 @@ static unsigned char* base64_decode(const unsigned char* input, size_t input_len
     }
     
     return output;
+}
+
+// 在全局定义部分添加 base64 编码相关函数
+static const char base64_chars[] = 
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789+/";
+
+static char* base64_encode(const uint8_t* input, size_t length, size_t* output_length) {
+    *output_length = 4 * ((length + 2) / 3);  // 计算编码后的长度
+    char* encoded_data = (char*)malloc(*output_length + 1);  // +1 用于 null 终止符
+    if (!encoded_data) return NULL;
+
+    size_t i = 0, j = 0;
+    size_t remaining = length;
+
+    while (remaining >= 3) {
+        encoded_data[j++] = base64_chars[(input[i] >> 2) & 0x3F];
+        encoded_data[j++] = base64_chars[((input[i] & 0x3) << 4) | ((input[i + 1] >> 4) & 0xF)];
+        encoded_data[j++] = base64_chars[((input[i + 1] & 0xF) << 2) | ((input[i + 2] >> 6) & 0x3)];
+        encoded_data[j++] = base64_chars[input[i + 2] & 0x3F];
+        i += 3;
+        remaining -= 3;
+    }
+
+    if (remaining > 0) {
+        encoded_data[j++] = base64_chars[(input[i] >> 2) & 0x3F];
+        if (remaining == 1) {
+            encoded_data[j++] = base64_chars[(input[i] & 0x3) << 4];
+            encoded_data[j++] = '=';
+        } else {  // remaining == 2
+            encoded_data[j++] = base64_chars[((input[i] & 0x3) << 4) | ((input[i + 1] >> 4) & 0xF)];
+            encoded_data[j++] = base64_chars[(input[i + 1] & 0xF) << 2];
+        }
+        encoded_data[j++] = '=';
+    }
+
+    encoded_data[j] = '\0';  // 添加 null 终止符
+    return encoded_data;
 }
 
 // 监控任务
@@ -346,7 +375,7 @@ static esp_err_t init_opus(void) {
     // 因为帧变大，可以适当降低比特率
     opus_encoder_ctl(encoder, OPUS_SET_BITRATE(12000));  // 12kbps也能保证质量
     opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(5));
-    opus_encoder_ctl(encoder, OPUS_SET_DTX(1));
+    opus_encoder_ctl(encoder, OPUS_SET_DTX(0));
     
     return ESP_OK;
 }
@@ -417,6 +446,8 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
     static uint32_t last_sequence_id = 0;
     static int64_t last_time = 0;
+    static char *message_buffer = NULL;
+    static size_t message_len = 0;
     
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
@@ -426,6 +457,11 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             
         case WEBSOCKET_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "WEBSOCKET_EVENT_DISCONNECTED");
+            if (message_buffer) {
+                free(message_buffer);
+                message_buffer = NULL;
+            }
+            message_len = 0;
             wsConnected = false;
             break;
             
@@ -436,106 +472,142 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             }
             
             // 检查是否是控制帧
-            if (data->op_code == WS_TRANSPORT_OPCODES_PING) {  // PING
+            if (data->op_code == 0x9) {  // PING
                 ESP_LOGI(TAG, "收到PING帧");
                 // 自动回复PONG
                 const uint8_t pong_data[] = {0x0A};
                 esp_websocket_client_send_with_opcode(client, WS_TRANSPORT_OPCODES_PONG, pong_data, 1, portMAX_DELAY);  // 0xA是PONG
                 return;
-            } else if (data->op_code == WS_TRANSPORT_OPCODES_PONG) {  // PONG
+            } else if (data->op_code == 0xA) {  // PONG
                 ESP_LOGI(TAG, "收到PONG帧");
                 return;
             }
 
-            // 确保数据完整性
-            if (data->payload_offset + data->data_len > data->payload_len) {
-                ESP_LOGW(TAG, "数据不完整，跳过处理");
-                return;
+            // 打印详细的帧信息
+            ESP_LOGD(TAG, "WebSocket帧信息: op_code=0x%x, fin=%d, payload_offset=%d, data_len=%d, payload_len=%d", 
+                     data->op_code, data->fin, data->payload_offset, data->data_len, data->payload_len);
+
+            if (data->payload_offset != 0) {
+                ESP_LOGW(TAG, "payload_offset != 0, 分帧");
+            }
+            // 如果是新消息的开始
+            if (data->payload_offset == 0) {
+                if (message_buffer) {
+                    free(message_buffer);
+                }
+                message_buffer = (char *)malloc(data->payload_len + 1);
+                message_len = 0;
             }
 
+            // 确保有足够的缓冲区空间
+            if (!message_buffer || (message_len + data->data_len) > data->payload_len) {
+                ESP_LOGE(TAG, "缓冲区错误");
+                if (message_buffer) {
+                    free(message_buffer);
+                    message_buffer = NULL;
+                }
+                return;
+            }
             // 只处理文本数据
-            if (data->op_code != WS_TRANSPORT_OPCODES_TEXT) {  // 0x1 是文本帧
-                ESP_LOGW(TAG, "非文本，跳过处理");
+            if (data->op_code != 0x1) {  // 0x1 是文本帧
+                ESP_LOGW(TAG, "非文本数据，跳过处理");
                 return;
             }
+            // 复制数据到缓冲区
+            memcpy(message_buffer + data->payload_offset, data->data_ptr, data->data_len);
+            message_len = data->payload_offset + data->data_len;
 
-            // 解析JSON数据
-            cJSON *root = cJSON_ParseWithLength((char*)data->data_ptr, data->data_len);
-            if (root) {
-                cJSON *type = cJSON_GetObjectItem(root, "type");
-                if (type && cJSON_IsString(type)) {
-                    if (strcmp(type->valuestring, "audio_batch") == 0) {
-                        cJSON *sequence = cJSON_GetObjectItem(root, "sequence");
-                        cJSON *batch = cJSON_GetObjectItem(root, "batch");
-                        cJSON *total_packets = cJSON_GetObjectItem(root, "total_packets");
-                        cJSON *packets = cJSON_GetObjectItem(root, "packets");
+            // 如果收到了完整的消息
+            if (message_len == data->payload_len) {
+                message_buffer[message_len] = '\0';
+                
+                // 解析JSON
+                cJSON *root = cJSON_Parse(message_buffer);
+                if (root) {
+                    cJSON *type = cJSON_GetObjectItem(root, "type");
+                    if (type && cJSON_IsString(type)) {
+                        if (strcmp(type->valuestring, "audio_batch") == 0) {
+                            cJSON *sequence = cJSON_GetObjectItem(root, "sequence");
+                            cJSON *batch = cJSON_GetObjectItem(root, "batch");
+                            cJSON *total_packets = cJSON_GetObjectItem(root, "total_packets");
+                            cJSON *packets = cJSON_GetObjectItem(root, "packets");
 
-                        if (sequence && batch && total_packets && packets &&
-                            cJSON_IsNumber(sequence) && cJSON_IsNumber(batch) &&
-                            cJSON_IsNumber(total_packets) && cJSON_IsArray(packets)) {
-                            
-                            uint32_t current_sequence = sequence->valueint;
-                            
-                            // 检查序列号连续性
-                            if (last_sequence_id != 0 && current_sequence != last_sequence_id + 1) {
-                                ESP_LOGW(TAG, "检测到批次丢失: 期望 %lu, 收到 %lu", 
-                                    last_sequence_id + 1, current_sequence);
-                            }
-                            last_sequence_id = current_sequence;
+                            if (sequence && batch && total_packets && packets &&
+                                cJSON_IsNumber(sequence) && cJSON_IsNumber(batch) &&
+                                cJSON_IsNumber(total_packets) && cJSON_IsArray(packets)) {
+                                
+                                uint32_t current_sequence = sequence->valueint;
+                                
+                                // 检查序列号连续性
+                                if (last_sequence_id != 0 && current_sequence != last_sequence_id + 1) {
+                                    ESP_LOGW(TAG, "检测到批次丢失: 期望 %lu, 收到 %lu", 
+                                        last_sequence_id + 1, current_sequence);
+                                }
+                                last_sequence_id = current_sequence;
 
-                            // 处理批次中的所有包
-                            int packet_count = cJSON_GetArraySize(packets);
-                            for (int i = 0; i < packet_count; i++) {
-                                cJSON *packet = cJSON_GetArrayItem(packets, i);
-                                if (!packet) continue;
+                                // 处理批次中的所有包
+                                int packet_count = cJSON_GetArraySize(packets);
+                                for (int i = 0; i < packet_count; i++) {
+                                    cJSON *packet = cJSON_GetArrayItem(packets, i);
+                                    if (!packet) continue;
 
-                                cJSON *audio_data = cJSON_GetObjectItem(packet, "data");
-                                cJSON *length = cJSON_GetObjectItem(packet, "length");
+                                    cJSON *audio_data = cJSON_GetObjectItem(packet, "data");
+                                    cJSON *length = cJSON_GetObjectItem(packet, "length");
 
-                                if (audio_data && length && 
-                                    cJSON_IsString(audio_data) && cJSON_IsNumber(length)) {
-                                    
-                                    // 解码base64数据
-                                    size_t decoded_len;
-                                    unsigned char *decoded_data = base64_decode(
-                                        (unsigned char*)audio_data->valuestring,
-                                        strlen(audio_data->valuestring),
-                                        &decoded_len
-                                    );
+                                    if (audio_data && length && 
+                                        cJSON_IsString(audio_data) && cJSON_IsNumber(length)) {
+                                        
+                                        // 解码base64数据
+                                        size_t decoded_len;
+                                        unsigned char *decoded_data = base64_decode(
+                                            (unsigned char*)audio_data->valuestring,
+                                            strlen(audio_data->valuestring),
+                                            &decoded_len
+                                        );
 
-                                    if (decoded_data && decoded_len == length->valueint) {
-                                        // 创建数据包
-                                        packet_data_t packet;
-                                        packet.data_length = decoded_len;
-                                        memcpy(packet.data, decoded_data, decoded_len);
+                                        if (decoded_data && decoded_len == length->valueint) {
+                                            // 创建数据包
+                                            packet_data_t packet;
+                                            packet.data_length = decoded_len;
+                                            memcpy(packet.data, decoded_data, decoded_len);
 
-                                        // 写入解码数据环形缓冲区
-                                        if (xSemaphoreTake(decoded_packets_buffer.mutex, portMAX_DELAY) == pdTRUE) {
-                                            if (decoded_packets_buffer_write(&decoded_packets_buffer, &packet)) {
-                                                xSemaphoreGive(decoded_packets_buffer.data_ready);
-                                            } else {
-                                                ESP_LOGE(TAG, "decoded_packets_buffer_write failed");
+                                            // 写入解码数据环形缓冲区
+                                            if (xSemaphoreTake(decoded_packets_buffer.mutex, portMAX_DELAY) == pdTRUE) {
+                                                if (decoded_packets_buffer_write(&decoded_packets_buffer, &packet)) {
+                                                    xSemaphoreGive(decoded_packets_buffer.data_ready);
+                                                } else {
+                                                    ESP_LOGE(TAG, "decoded_packets_buffer_write failed");
+                                                }
+                                                xSemaphoreGive(decoded_packets_buffer.mutex);
                                             }
-                                            xSemaphoreGive(decoded_packets_buffer.mutex);
+                                            ESP_LOGD(TAG, "ring buffer len: %d", decoded_packets_buffer.packet_count);
                                         }
-                                        ESP_LOGD(TAG, "ring buffer len: %d", decoded_packets_buffer.packet_count);
-                                    }
-                                    if (decoded_data) {
-                                        free(decoded_data);
+                                        if (decoded_data) {
+                                            free(decoded_data);
+                                        }
                                     }
                                 }
+                                ESP_LOGD(TAG, "处理批次 %d: 成功处理 %d 个包", 
+                                    batch->valueint, packet_count);
+                                int64_t current_time = esp_timer_get_time() / 1000;
+                                if (current_time - last_time > 1000) {
+                                    ESP_LOGW(TAG, "websocket_event_handler time overtime: %lld ms", current_time - last_time);
+                                }
+                                last_time = current_time;
                             }
-                            ESP_LOGI(TAG, "处理批次 %d: 成功处理 %d 个包", 
-                                batch->valueint, packet_count);
-                            int64_t current_time = esp_timer_get_time() / 1000;
-                            ESP_LOGI(TAG, "task cycle time: %lld ms", current_time - last_time);
-                            last_time = current_time;
                         }
                     }
+                    cJSON_Delete(root);
+                } else {
+                    ESP_LOGW(TAG, "JSON解析失败: %.*s", 
+                            message_len > 100 ? 100 : message_len, 
+                            message_buffer);
                 }
-                cJSON_Delete(root);
-            } else {
-                ESP_LOGW(TAG, "JSON解析失败: %.*s, type=%d", data->data_len, (char*)data->data_ptr, data->op_code);
+
+                // 清理缓冲区
+                free(message_buffer);
+                message_buffer = NULL;
+                message_len = 0;
             }
             break;
         }
@@ -550,34 +622,43 @@ static void audio_input_task(void *parameter)
 {
     static audio_data_t inputData = {};
     size_t bytes_read;
-    
+    int64_t last_time = 0;
     while (1) {
         // 读取一次数据（阻塞式）
         esp_err_t ret = read_mic_data(inputData.buffer, 
                                     sizeof(inputData.buffer), 
                                     &bytes_read);
-                                    
+
         if (ret == ESP_OK && bytes_read > 0) {
             inputData.size = bytes_read;
-            // mic_data_handle(inputData.buffer, inputData.size);
-
+            mic_data_handle(inputData.buffer, inputData.size);
+#ifndef TEST_MIC_AUDIO
             // 将数据写入队列
             if (xQueueSend(audioEncodeQueue, &inputData, 0) != pdPASS) {
                 ESP_LOGW(TAG, "Audio encode queue is full");
             }
-            // if (xSemaphoreTake(audio_ring_buffer.mutex, portMAX_DELAY) == pdTRUE) {
-            //     size_t write_size = audio_ring_buffer_write(&audio_ring_buffer, 
-            //                     (uint8_t*)inputData.buffer, 
-            //                     inputData.size);
-            //     if (write_size <= 0) {
-            //         ESP_LOGE(TAG, "audio output ring buffer full");
-            //     }
-            //     xSemaphoreGive(audio_ring_buffer.mutex);
-            //     xSemaphoreGive(audio_ring_buffer.data_ready);
-            // }
+#else
+            if (xSemaphoreTake(audio_ring_buffer.mutex, portMAX_DELAY) == pdTRUE) {
+                size_t write_size = audio_ring_buffer_write(&audio_ring_buffer, 
+                                (uint8_t*)inputData.buffer, 
+                                inputData.size);
+                if (write_size <= 0) {
+                    ESP_LOGE(TAG, "audio output ring buffer full");
+                }
+                xSemaphoreGive(audio_ring_buffer.mutex);
+                xSemaphoreGive(audio_ring_buffer.data_ready);
+            }
+#endif
         } else {
             ESP_LOGE(TAG, "Read mic data error: %d", ret);
         }
+
+        int64_t current_time = esp_timer_get_time() / 1000;
+        if (current_time - last_time > 100) {
+            ESP_LOGE(TAG, "audio_input_task time overtime: %lld ms", current_time - last_time);
+        }
+        last_time = current_time;
+
     }
 }
 
@@ -701,7 +782,7 @@ static void audio_encode_task(void *parameter)
 {
     static audio_data_t inputData = {};
     static packet_data_t packet_data = {};
-    
+    int64_t last_time = 0;
     while (1) {
         // 从输入队列接收音频数据
         if (xQueueReceive(audioEncodeQueue, &inputData, portMAX_DELAY) == pdPASS) {
@@ -732,6 +813,11 @@ static void audio_encode_task(void *parameter)
                 xSemaphoreGive(encoded_packets_buffer.mutex);
             }
         }
+        int64_t current_time = esp_timer_get_time() / 1000;
+        if (current_time - last_time > 100) {
+            ESP_LOGE(TAG, "audio_encode_task time overtime: %lld ms", current_time - last_time);
+        }
+        last_time = current_time;
     }
 }
 
@@ -843,8 +929,7 @@ static void audio_decode_task(void *parameter) {
 static void websocket_send_task(void *parameter)
 {
     static packet_data_t packet_data = {};
-    const size_t MAX_SEND_SIZE = 1024;
-
+    int64_t last_time = 0;
     while (1) {
         if (!wsConnected) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -856,79 +941,63 @@ static void websocket_send_task(void *parameter)
             // 持续处理，直到缓冲区为空
             while (1) {
                 bool has_data = false;
-                
                 // 从编码环形缓冲区读取数据
                 if (xSemaphoreTake(encoded_packets_buffer.mutex, portMAX_DELAY) == pdTRUE) {
                     has_data = encoded_packets_buffer_read(&encoded_packets_buffer, &packet_data);
                     xSemaphoreGive(encoded_packets_buffer.mutex);
                 }
 
-                // 如果没有更多数据，退出循环
                 if (!has_data) {
-                    break;
+                    break;  // 缓冲区已空
                 }
 
-                // 处理读取到的数据包
-                size_t packet_total_size = sizeof(uint16_t) + packet_data.data_length;
-                
-                // 检查是否需要发送当前缓冲区
-                if ((ws_send_buffer.current_size + packet_total_size) > sizeof(ws_send_buffer.buffer) ||
-                    (ws_send_buffer.current_size + packet_total_size - sizeof(packet_header_t)) >= MAX_SEND_SIZE) {
-                    
-                    if (ws_send_buffer.packet_count > 0) {
-                        // 填充头部并发送
-                        packet_header_t *header = (packet_header_t *)ws_send_buffer.buffer;
-                        header->total_length = ws_send_buffer.current_size - sizeof(packet_header_t);
-                        header->total_packets = ws_send_buffer.packet_count;
-
-                        // esp_websocket_client_send_bin(client, 
-                        //                             (const char*)ws_send_buffer.buffer,
-                        //                             ws_send_buffer.current_size,
-                        //                             portMAX_DELAY);
-                        
-                        ESP_LOGI(TAG, "Sent buffer: size=%d, packets=%d", 
-                                ws_send_buffer.current_size,
-                                ws_send_buffer.packet_count);
-
-                        // 重置发送缓冲区
-                        ws_send_buffer.current_size = sizeof(packet_header_t);
-                        ws_send_buffer.packet_count = 0;
-                    }
+                // 创建单个数据包的JSON对象
+                cJSON *packet = cJSON_CreateObject();
+                if (!packet) {
+                    ESP_LOGE(TAG, "创建JSON对象失败");
+                    continue;
                 }
 
-                // 添加新的数据包到发送缓冲区
-                memcpy(ws_send_buffer.buffer + ws_send_buffer.current_size,
-                      &packet_data.data_length,
-                      sizeof(uint16_t));
-                ws_send_buffer.current_size += sizeof(uint16_t);
+                // 添加类型和序列号
+                cJSON_AddStringToObject(packet, "type", "audio_batch");
+                cJSON_AddNumberToObject(packet, "sequence", sequence_id++);
 
-                memcpy(ws_send_buffer.buffer + ws_send_buffer.current_size,
-                      packet_data.data,
-                      packet_data.data_length);
-                ws_send_buffer.current_size += packet_data.data_length;
-                ws_send_buffer.packet_count++;
-            }
+                // Base64编码音频数据
+                size_t encoded_len = 0;
+                char *base64_data = base64_encode(packet_data.data, 
+                                                packet_data.data_length, 
+                                                &encoded_len);
+                if (!base64_data) {
+                    cJSON_Delete(packet);
+                    ESP_LOGE(TAG, "Base64编码失败");
+                    continue;
+                }
 
-            // 发送最后剩余的数据（如果有的话）
-            if (ws_send_buffer.packet_count > 0) {
-                packet_header_t *header = (packet_header_t *)ws_send_buffer.buffer;
-                header->total_length = ws_send_buffer.current_size - sizeof(packet_header_t);
-                header->total_packets = ws_send_buffer.packet_count;
+                // 添加音频数据
+                cJSON_AddStringToObject(packet, "data", base64_data);
+                cJSON_AddNumberToObject(packet, "length", packet_data.data_length);
+                free(base64_data);
 
-                // esp_websocket_client_send_bin(client, 
-                //                             (const char*)ws_send_buffer.buffer,
-                //                             ws_send_buffer.current_size,
-                //                             portMAX_DELAY);
+                // 转换为字符串并发送
+                char *json_str = cJSON_PrintUnformatted(packet);
+                if (json_str) {
+                    esp_websocket_client_send_text(client, json_str, strlen(json_str), portMAX_DELAY);
+                    ESP_LOGD(TAG, "发送音频数据: sequence=%lu, size=%d", 
+                            sequence_id - 1, packet_data.data_length);
+                    free(json_str);
+                }
+
+                cJSON_Delete(packet);
                 
-                // ESP_LOGI(TAG, "Sent final buffer: size=%d, packets=%d", 
-                //         ws_send_buffer.current_size,
-                //         ws_send_buffer.packet_count);
-
-                // 重置发送缓冲区
-                ws_send_buffer.current_size = sizeof(packet_header_t);
-                ws_send_buffer.packet_count = 0;
+                // 短暂延时以避免发送过快
+                vTaskDelay(pdMS_TO_TICKS(5));
             }
         }
+        int64_t current_time = esp_timer_get_time() / 1000;
+        if (current_time - last_time > 500) {
+            ESP_LOGE(TAG, "websocket send task overtime: %lld ms", current_time - last_time);
+        }
+        last_time = current_time;
     }
 }
 
@@ -998,9 +1067,6 @@ void app_main(void)
     ESP_LOGI(TAG, "PSRAM free: %d bytes", 
         heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    // 初始化发送缓冲区
-    ws_send_buffer.current_size = sizeof(packet_header_t);
-    ws_send_buffer.packet_count = 0;
 
     // 初始化 WebSocket 客户端配置
     esp_websocket_client_config_t websocket_cfg = {};
@@ -1008,6 +1074,7 @@ void app_main(void)
     websocket_cfg.reconnect_timeout_ms = 10000;  // 重连超时时间
     websocket_cfg.network_timeout_ms = 10000;    // 网络超时时间
     websocket_cfg.disable_auto_reconnect = false; // 启用自动重连
+    websocket_cfg.buffer_size = 2048;
     
     ESP_LOGI(TAG, "Connecting to %s...", websocket_cfg.uri);
 
@@ -1019,20 +1086,13 @@ void app_main(void)
     BaseType_t xReturned;
     
     // 创建音频输入任务
-    xReturned = xTaskCreatePinnedToCore(audio_input_task, "AudioInput", 8192, NULL, 5, &audioInputTaskHandle, 0);
+    xReturned = xTaskCreatePinnedToCore(audio_input_task, "AudioInput", 4096, NULL, 5, &audioInputTaskHandle, 0);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio input task");
     }
 
     // 创建编码任务
-    xReturned = xTaskCreatePinnedToCore(
-        audio_encode_task,
-        "AudioEncode",
-        32 * 1024 / sizeof(StackType_t),  // 保持32K栈大小
-        NULL,
-        5,
-        NULL,
-        1);
+    xReturned = xTaskCreatePinnedToCore(audio_encode_task, "AudioEncode", 26 * 1024 / sizeof(StackType_t), NULL, 4, NULL, 1);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio encode task");
     }
@@ -1044,13 +1104,13 @@ void app_main(void)
     }
 
     // 创建音频输出任务
-    xReturned = xTaskCreatePinnedToCore(audio_output_task, "AudioOutput", 4096, NULL, 3, &audioOutputTaskHandle, 1);
+    xReturned = xTaskCreatePinnedToCore(audio_output_task, "AudioOutput", 4096, NULL, 5, &audioOutputTaskHandle, 1);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio output task");
     }
 
     // 创建WebSocket发送任务
-    xReturned = xTaskCreatePinnedToCore(websocket_send_task, "WSSend", 8192, NULL, 4, &wsTaskHandle, 0);
+    xReturned = xTaskCreatePinnedToCore(websocket_send_task, "WSSend", 8192, NULL, 5, &wsTaskHandle, 0);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create websocket send task");
     }

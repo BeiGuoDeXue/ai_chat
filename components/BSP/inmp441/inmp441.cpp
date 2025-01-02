@@ -11,9 +11,9 @@ static const char *TAG = "INMP441";
 i2s_config_t inmp441_i2s_config = {
     .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),              // 主模式 + 接收模式
     .sample_rate = INMP441_SAMPLE_RATE,                             // 采样率
-    .bits_per_sample = i2s_bits_per_sample_t(16),                   // 16位采样精度
+    .bits_per_sample = i2s_bits_per_sample_t(32),                   // 16位采样精度
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,                    // 仅使用左声道
-    .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S), // I2S标准通信格式
+    .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_MSB), // I2S标准通信格式
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,                       // 中断优先级设置
     .dma_buf_count = 4,                                             // DMA缓冲区数量
     .dma_buf_len = 960,                                             // 每个DMA缓冲区长度
@@ -77,6 +77,27 @@ esp_err_t start_mic(void)
  */
 esp_err_t read_mic_data(int16_t *data_in, int data_len, size_t *bytes_read)
 {
+    static int32_t buffer[1024];
+    if (data_in == NULL || data_len <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = i2s_read(I2S_NUM_0, buffer, data_len * 2, bytes_read, portMAX_DELAY);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Error reading I2S data: %d", ret);
+        return ret;
+    }
+    for (size_t i = 0; i < *bytes_read / 4; i++)
+    {
+        int32_t temp = buffer[i] >> 12;
+        data_in[i] = (int16_t)temp;
+    }
+    *bytes_read = *bytes_read / 2;
+    return ret;
+}
+
+esp_err_t read16_mic_data(int16_t *data_in, int data_len, size_t *bytes_read)
+{
     if (data_in == NULL || data_len <= 0) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -103,12 +124,12 @@ void mic_data_handle(int16_t *data_in, size_t bytes_read) {
             data_in[i] = 0;
         }
         
-        // 2. 音量调节
-        data_in[i] = data_in[i] * 4;
+        // // 2. 音量调节
+        // data_in[i] = data_in[i] * 4;
         
-        // 3. 削波保护
-        if(data_in[i] > 32767) data_in[i] = 32767;
-        if(data_in[i] < -32767) data_in[i] = -32767;
+        // // 3. 削波保护
+        // if(data_in[i] > 32767) data_in[i] = 32767;
+        // if(data_in[i] < -32767) data_in[i] = -32767;
     }
 }
 

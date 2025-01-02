@@ -28,8 +28,8 @@ def pcm_to_wav(pcm_file, wav_file, channels=1, sample_width=2, sample_rate=16000
 # 使用示例
 if __name__ == "__main__":
     # 设置输入输出文件路径
-    input_pcm = "server/audio_files/audio_1735200886.917433.pcm"
-    output_wav = "server/audio_files/audio_1735200886.917433.wav"
+    input_pcm = "server/audio_files/pcm/20250102122331.pcm"
+    output_wav = "server/audio_files/wav/20250102122331.wav"
     
     # 转换文件
     pcm_to_wav(input_pcm, output_wav)

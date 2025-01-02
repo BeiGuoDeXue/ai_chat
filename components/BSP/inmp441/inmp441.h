@@ -31,6 +31,7 @@ esp_err_t stop_mic(void);
 esp_err_t start_mic(void);
 esp_err_t inmp441_deinit(void);
 esp_err_t read_mic_data(int16_t *data_in, int data_len, size_t *bytes_read);
+esp_err_t read16_mic_data(int16_t *data_in, int data_len, size_t *bytes_read);
 void mic_data_handle(int16_t *data_in, size_t bytes_read);
 
 #endif // INMP441_H
