@@ -631,7 +631,6 @@ static void audio_input_task(void *parameter)
 
         if (ret == ESP_OK && bytes_read > 0) {
             inputData.size = bytes_read;
-            mic_data_handle(inputData.buffer, inputData.size);
 #ifndef TEST_MIC_AUDIO
             // 将数据写入队列
             if (xQueueSend(audioEncodeQueue, &inputData, 0) != pdPASS) {

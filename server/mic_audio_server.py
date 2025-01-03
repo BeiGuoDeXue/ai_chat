@@ -1,15 +1,12 @@
 import asyncio
 import websockets
-from aip import AipSpeech
 import numpy as np
 from collections import deque
 import time
 from audio_codec import AudioCodec
 import threading
-import struct
 import pyaudio
 import os
-import wave  # 添加到文件顶部的导入语句中
 from llm.zhipu_client import ZhipuClient
 from llm.volcengine_client import VolcengineClient
 import webrtcvad
@@ -21,6 +18,11 @@ from audio_analyzer import analyze_audio_energy
 import itertools
 import datetime
 import queue
+from audio_recorder import AudioRecorder
+from audio_player import AudioPlayer
+from speech_service import SpeechService
+from audio_saver import AudioSaver
+from vad_detector import VadDetector
 
 # 设置控制台输出编码
 if sys.platform == 'win32':
@@ -30,21 +32,17 @@ load_dotenv()
 
 class AudioChatServer:
     def __init__(self):
-        # 百度语音配置
-        self.APP_ID = '116470106'
-        self.API_KEY = 'ibrjXDUQ6FgjrvSQJ4GANDBA'
-        self.SECRET_KEY = '0xZe4laRgQbZrxAECCcKqeRZ1R8j3Jq1'
-        self.baidu_client = AipSpeech(self.APP_ID, self.API_KEY, self.SECRET_KEY)
-    
+        # 初始化语音服务
+        self.speech_service = SpeechService()
+        
+        # 初始化录音器
+        self.recorder = AudioRecorder()
+        
         # 音频配置
         self.CHUNK = 1024
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
         self.RATE = 16000
-        
-        # 初始化 PyAudio
-        self.audio = pyaudio.PyAudio()
-        self.stream = None
         
         # 初始化音频编解码器
         self.audio_codec = AudioCodec()
@@ -72,16 +70,8 @@ class AudioChatServer:
         # 分包大小
         self.PACKET_SIZE = 1024
 
-        # 录音状态控制
-        self.is_recording = False
-        self.recording_thread = None
-
         # 添加锁
         self.buffer_lock = threading.Lock()
-        
-        # 语音状态
-        self.is_speaking = False
-        self.silence_frames = 0
 
         # 数据发送完成
         self.data_send_complete = True
@@ -99,24 +89,10 @@ class AudioChatServer:
         # 默认使用智谱AI
         self.current_llm = "volcengine"  # 可以是 "zhipu" 或 "volcengine"
 
-        # 初始化 WebRTC VAD
-        self.vad = webrtcvad.Vad()
-        # 设置VAD的激进程度 (0-3)，数字越大越激进
-        # 0: 最不激进，容易检测到语音
-        # 3: 最激进，只检测很确定的语音
-        self.vad.set_mode(3)
-        
-        # VAD 相关参数
-        self.vad_frame_duration = 30  # 每帧持续时间(ms)，可选值：10, 20, 30
-        self.vad_frame_size = int(self.RATE * self.vad_frame_duration / 1000) * 2  # 每帧样本数
-        self.vad_active_frames = 0  # 连续检测到语音的帧数
-        self.vad_inactive_frames = 0  # 连续检测到静音的帧数
-        self.speech_started = False  # 是否开始检测到语音
-        self.speech_buffer = bytearray()  # 存储语音数据
-
+        # 初始化 VAD 检测器
+        self.vad_detector = VadDetector(sample_rate=self.RATE)
         # 初始化包序列号
         self.sequence_id = 0
-
         # 添加流控制相关的属性
         self.flow_control_paused = False
         self.pause_event = asyncio.Event()
@@ -125,57 +101,15 @@ class AudioChatServer:
         # 测试模式
         self.test_mode = False
 
-        self.output_stream = None  # 添加输出流属性
+        # 初始化音频播放器
+        self.player = AudioPlayer()
 
-        # 添加播放队列和播放线程
-        self.play_queue = queue.Queue()
-        self.play_thread = threading.Thread(target=self._play_audio_worker)
-        self.play_thread.daemon = True
-        self.play_thread.start()
-
-    def start_recording(self):
-        """开始录音"""
-        if self.is_recording:
-            return
-            
-        self.stream = self.audio.open(
-            format=self.FORMAT,
+        # 初始化音频保存器
+        self.audio_saver = AudioSaver(
             channels=self.CHANNELS,
-            rate=self.RATE,
-            input=True,
-            frames_per_buffer=self.CHUNK
+            sample_format=self.FORMAT,
+            rate=self.RATE
         )
-        
-        self.is_recording = True
-        self.recording_thread = threading.Thread(target=self._record_audio)
-        self.recording_thread.start()
-        print("开始录音...")
-
-    def stop_recording(self):
-        """停止录音"""
-        self.is_recording = False
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-        if self.recording_thread:
-            self.recording_thread.join()
-        print("停止录音...")
-
-    def _record_audio(self):
-        """录音线程"""
-        while self.is_recording:
-            if self.data_send_complete:
-                try:
-                    # 读取音频数据
-                    audio_data = self.stream.read(self.CHUNK, exception_on_overflow=False)
-                    
-                    # 更新缓冲区
-                    with self.buffer_lock:
-                        self.update_buffer(audio_data)
-
-                except Exception as e:
-                    print(f"录音错误: {e}")
-                    break
 
     async def handle_websocket(self, websocket):
         """处理WebSocket连接"""
@@ -334,7 +268,7 @@ class AudioChatServer:
                 except Exception as e:
                     print(f"发送最后批次失败: {e}")
             
-            await asyncio.sleep(2)  # 发送完成后等待2s用于喇叭播放
+            await asyncio.sleep(4)  # 发送完成后等待2s用于喇叭播放
             self.data_send_complete = True
 
         except Exception as e:
@@ -353,7 +287,7 @@ class AudioChatServer:
     def get_process_data(self):
         """使用 WebRTC VAD 获取待处理的数据，并检测语音结束"""
         try:
-            if self.buffer_count < self.vad_frame_size:
+            if self.buffer_count < self.vad_detector.vad_frame_size:
                 return None
 
             # 计算要处理的数据量(不超过缓冲区大小)
@@ -368,56 +302,7 @@ class AudioChatServer:
                 self.audio_buffer.popleft()
                 self.buffer_count -= 1
 
-            # 将数据分割成VAD帧大小的块
-            frames = [frame_data[i:i+self.vad_frame_size] 
-                     for i in range(0, len(frame_data), self.vad_frame_size)
-                     if len(frame_data[i:i+self.vad_frame_size]) == self.vad_frame_size]
-            
-            speech_detected = False
-            for frame in frames:
-                try:
-                    is_speech = self.vad.is_speech(bytes(frame), self.RATE)
-                    
-                    if is_speech:
-                        self.vad_active_frames += 1
-                        self.vad_inactive_frames = 0
-                        if self.vad_active_frames >= 3:  # 连续3帧检测到语音才开始记录
-                            self.speech_started = True
-                            speech_detected = True
-                    else:
-                        self.vad_inactive_frames += 1
-                        self.vad_active_frames = 0
-                    
-                    # 如果已经开始检测到语音，将数据添加到语音缓冲区
-                    if self.speech_started:
-                        self.speech_buffer.extend(frame)
-
-                except Exception as e:
-                    print(f"处理单个帧时出错: {e}")
-                    continue
-
-            if speech_detected:
-                print("检测到语音开始")
-            else:
-                print("检测到静音")
-
-            # 检查是否需要结束当前语音段
-            if self.speech_started and self.vad_inactive_frames >= 15:
-                print("检测到语音结束")
-                self.speech_started = False
-                speech_data = bytes(self.speech_buffer)
-                self.speech_buffer.clear()
-                self.vad_active_frames = 0
-                self.vad_inactive_frames = 0
-                
-                # 检查语音长度是否足够
-                if len(speech_data) > self.RATE * 1:  # 至少1秒的语音
-                    print(f"返回语音片段，长度: {len(speech_data)}字节")
-                    return speech_data
-                else:
-                    print(f"语音长度不足: {len(speech_data)}字节")
-            
-            return None
+            return self.vad_detector.process_audio(frame_data)
 
         except Exception as e:
             print(f"处理音频数据时发生错误: {e}")
@@ -521,61 +406,19 @@ class AudioChatServer:
 
     def speech_to_text(self, audio_data):
         """语音转文字"""
-        try:
-            result = self.baidu_client.asr(audio_data, 'pcm', 16000, {
-                'dev_pid': 1537,  # 普通话(支持简单的英文识别)
-            })
-            
-            if result['err_no'] == 0:
-                return result['result'][0]
-            else:
-                print(f"语音识别错误: {result}")
-                return None
-        except Exception as e:
-            print(f"语音识别异常: {e}")
-            return None
+        return self.speech_service.speech_to_text(audio_data)
 
     def save_pcm(self, audio_data, filename):
         """保存PCM格式音频文件"""
-        with open(filename, 'wb') as f:
-            f.write(audio_data)
-        print(f"PCM音频已保存到: {filename}")
+        self.audio_saver.save_pcm(audio_data, filename)
 
     def save_wav(self, audio_data, filename):
         """保存WAV格式音频文件"""
-        try:
-            with wave.open(filename, 'wb') as wav_file:
-                wav_file.setnchannels(self.CHANNELS)
-                wav_file.setsampwidth(self.audio.get_sample_size(self.FORMAT))
-                wav_file.setframerate(self.RATE)
-                wav_file.writeframes(audio_data)
-            print(f"WAV音频已保存到: {filename}")
-        except Exception as e:
-            print(f"保存WAV文件时出错: {e}")
-
+        self.audio_saver.save_wav(audio_data, filename)
 
     def text_to_speech(self, text):
         """文字转语音"""
-        try:
-            result = self.baidu_client.synthesis(text, 'zh', 1, {
-                'spd': 5,  # 语速，取值0-15
-                'pit': 5,  # 音调，取值0-15
-                'vol': 1,  # 音量，取值0-15
-                'per': 1,  # 发音人，0为女声，1为男声，3为情感男声，4为情感女声
-                'aue': 6,  # 返回PCM格式音频
-            })
-            
-            # 增加错误处理
-            if isinstance(result, dict):
-                print(f"语音合成错误: {result}")
-                return []
-            
-            # 直接返回result，不再转为字典，也不限制大小
-            return result
-            
-        except Exception as e:
-            print(f"语音合成异常: {e}")
-            return []
+        return self.speech_service.text_to_speech(text)
 
     def read_audio(self, filename):
         """读取音频文件"""
@@ -584,12 +427,9 @@ class AudioChatServer:
 
     def cleanup(self):
         """清理资源"""
-        self.stop_recording()
-        # 停止播放线程
-        self.play_queue.put(None)
-        self.play_thread.join()
-        self.close_output_stream()
-        self.audio.terminate()
+        self.recorder.cleanup()
+        self.player.cleanup()
+        self.audio_saver.cleanup()
 
     async def get_llm_response(self, text: str) -> str:
         """获取大语言模型回复"""
@@ -600,44 +440,7 @@ class AudioChatServer:
 
     def play_audio(self, audio_data):
         """将音频数据加入播放队列"""
-        try:
-            self.play_queue.put(audio_data)
-        except Exception as e:
-            print(f"添加音频到播放队列时出错: {e}")
-
-    def close_output_stream(self):
-        """关闭音频输出流"""
-        if self.output_stream:
-            try:
-                self.output_stream.stop_stream()
-                self.output_stream.close()
-            except Exception as e:
-                print(f"关闭输出流时出错: {e}")
-            finally:
-                self.output_stream = None
-
-    def _play_audio_worker(self):
-        """音频播放工作线程"""
-        while True:
-            try:
-                audio_data = self.play_queue.get()
-                if audio_data is None:  # 用于停止线程的信号
-                    break
-                    
-                if not self.output_stream:
-                    self.output_stream = self.audio.open(
-                        format=self.FORMAT,
-                        channels=self.CHANNELS,
-                        rate=self.RATE,
-                        output=True
-                    )
-                    
-                self.output_stream.write(audio_data)
-                self.play_queue.task_done()
-                
-            except Exception as e:
-                print(f"播放音频线程错误: {e}")
-                self.close_output_stream()
+        self.player.play_audio(audio_data)
 
 async def main():
     server = AudioChatServer()
