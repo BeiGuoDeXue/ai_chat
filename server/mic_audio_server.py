@@ -9,7 +9,6 @@ import pyaudio
 import os
 from llm.zhipu_client import ZhipuClient
 from llm.volcengine_client import VolcengineClient
-import webrtcvad
 from dotenv import load_dotenv
 import json
 import base64
@@ -194,6 +193,7 @@ class AudioChatServer:
             current_size = 0
             batch_number = 0
             self.data_send_complete = False
+            print("开始发送音频数据, 数据包数量: ", len(encoded_packets))
             for packet in encoded_packets:
                 # 等待恢复发送信号
                 await self.pause_event.wait()
@@ -221,8 +221,8 @@ class AudioChatServer:
                     
                     try:
                         await websocket.send(json.dumps(batch_data))
-                        print(f"发送批次 {batch_number}: {len(current_batch)}个包, "
-                              f"sequence={self.sequence_id}, size={current_size}字节")
+                        # print(f"发送批次 {batch_number}: {len(current_batch)}个包, "
+                        #       f"sequence={self.sequence_id}, size={current_size}字节")
                         
                         # 重置当前批次
                         current_batch = []
@@ -267,7 +267,7 @@ class AudioChatServer:
                     print("WebSocket连接已关闭")
                 except Exception as e:
                     print(f"发送最后批次失败: {e}")
-            
+            print("发送音频数据完成")
             await asyncio.sleep(4)  # 发送完成后等待2s用于喇叭播放
             self.data_send_complete = True
 
@@ -295,7 +295,7 @@ class AudioChatServer:
             
             # 从缓冲区一次性提取所需数据
             frame_data = bytearray(list(itertools.islice(self.audio_buffer, 0, process_size)))
-            print(f"处理数据大小: {len(frame_data)}字节, 剩余缓冲区: {self.buffer_count - len(frame_data)}字节")
+            # print(f"处理数据大小: {len(frame_data)}字节, 剩余缓冲区: {self.buffer_count - len(frame_data)}字节")
             
             # 更新缓冲区和计数
             for _ in range(len(frame_data)):
@@ -310,7 +310,7 @@ class AudioChatServer:
 
     async def process_audio_loop(self):
         """定期处理音频数据的循环"""
-        time1 = time.time()
+        # time1 = time.time()
         while True:
             try:
                 if not self.test_mode:
@@ -371,9 +371,9 @@ class AudioChatServer:
                                 else:
                                     print("没有识别到语音, text: ", text)
 
-                        time2 = time.time()
-                        print("process_audio_loop period: ", time2 - time1)
-                        time1 = time2
+                        # time2 = time.time()
+                        # print("process_audio_loop period: ", time2 - time1)
+                        # time1 = time2
                 else:
                     audio_data = self.read_audio("../server/audio_files/pcm/qiufeng.pcm")
                     if audio_data:
@@ -383,7 +383,6 @@ class AudioChatServer:
 
             except Exception as e:
                 print(f"处理音频数据错误: {e}")
-                # await asyncio.sleep(1)
 
     async def send_worker(self, websocket):
         """独立的发送协程"""

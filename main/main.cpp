@@ -136,6 +136,8 @@ static const unsigned char base64_table[256] = {
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64
 };
 
+static esp_websocket_client_handle_t init_websocket(void);
+
 // Base64解码函数
 static unsigned char* base64_decode(const unsigned char* input, size_t input_len, size_t* output_len) {
     if (input_len % 4 != 0) return NULL;
@@ -464,7 +466,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             message_len = 0;
             wsConnected = false;
             break;
-            
+
         case WEBSOCKET_EVENT_DATA:
         {
             if (!wsConnected || !data->data_len) {
@@ -1000,6 +1002,49 @@ static void websocket_send_task(void *parameter)
     }
 }
 
+// WebSocket 初始化函数
+static esp_websocket_client_handle_t init_websocket(void) {
+    esp_websocket_client_config_t websocket_cfg = {};
+    websocket_cfg.uri = WS_URI;
+    websocket_cfg.reconnect_timeout_ms = 3000;     // 减少重连超时时间到3秒
+    websocket_cfg.network_timeout_ms = 5000;       // 减少网络超时时间到5秒
+    websocket_cfg.disable_auto_reconnect = false;  // 保持自动重连开启
+    websocket_cfg.buffer_size = 2048;
+    websocket_cfg.ping_interval_sec = 5;           // 设置 ping 间隔为5秒
+    websocket_cfg.disable_pingpong_discon = false; // 启用 ping-pong 超时断开
+    websocket_cfg.pingpong_timeout_sec = 10;       // 10秒没收到 pong 就断开
+
+    ESP_LOGI(TAG, "init_websocket Connecting to %s...", websocket_cfg.uri);
+
+    esp_websocket_client_handle_t client = esp_websocket_client_init(&websocket_cfg);
+    ESP_ERROR_CHECK(esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_websocket_client_start(client));
+    
+    return client;
+}
+
+// 添加 WebSocket 连接监控任务
+static void websocket_monitor_task(void* arg) {
+    while (1) {
+        if (!wsConnected || !esp_websocket_client_is_connected(client)) {
+            ESP_LOGW(TAG, "WebSocket连接断开或未连接，尝试重新连接...");
+            
+            // 停止当前的WebSocket客户端
+            esp_websocket_client_stop(client);
+            esp_websocket_client_destroy(client);
+            
+            // 延迟一小段时间后重新创建连接
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            
+            // 使用封装的初始化函数重新创建客户端
+            client = init_websocket();
+        }
+        
+        // 每秒检查一次连接状态
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -1067,19 +1112,8 @@ void app_main(void)
         heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
 
-    // 初始化 WebSocket 客户端配置
-    esp_websocket_client_config_t websocket_cfg = {};
-    websocket_cfg.uri = WS_URI;
-    websocket_cfg.reconnect_timeout_ms = 10000;  // 重连超时时间
-    websocket_cfg.network_timeout_ms = 10000;    // 网络超时时间
-    websocket_cfg.disable_auto_reconnect = false; // 启用自动重连
-    websocket_cfg.buffer_size = 2048;
-    
-    ESP_LOGI(TAG, "Connecting to %s...", websocket_cfg.uri);
-
-    client = esp_websocket_client_init(&websocket_cfg);
-    ESP_ERROR_CHECK(esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_websocket_client_start(client));
+    // 使用封装的初始化函数创建 WebSocket 客户端
+    client = init_websocket();
 
     // 创建所有任务，并检查是否创建成功
     BaseType_t xReturned;
@@ -1124,6 +1158,12 @@ void app_main(void)
     xReturned = xTaskCreatePinnedToCore(flow_control_task, "flow_control", 4096, NULL, 5, NULL, 0);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create flow control task");
+    }
+
+    // 创建 WebSocket 监控任务
+    xReturned = xTaskCreatePinnedToCore(websocket_monitor_task, "WSMonitor", 4096, NULL, 5, NULL, 0);
+    if (xReturned != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create websocket monitor task");
     }
 
     ESP_LOGI(TAG, "All tasks created successfully");
