@@ -16,7 +16,7 @@
 #define MAX98357_DIN 16  // DIN: 数据输入引脚，用于传输音频数据
 
 #define MAX98357_SD_MODE_PIN GPIO_NUM_3 // SD_MODE: 控制芯片的开关，HIGH-使能，LOW-关闭
-
+// #define MAX98357_SD_MODE_PIN GPIO_NUM_15 // SD_MODE: 控制芯片的开关，HIGH-使能，LOW-关闭
 // 音频采样率设置 (Hz)
 #define MAX98357_SAMPLE_RATE 16000
 

@@ -18,6 +18,8 @@
 #include "esp_heap_caps.h"
 #include "esp_cpu.h"
 #include "cJSON.h"
+#include "esp_wifi.h"
+#include "esp_wifi_types.h"
 
 // 定义监控间隔（5秒）
 #define MONITOR_INTERVAL_MS 5000
@@ -30,7 +32,8 @@
 #define FLOW_CONTROL_THRESHOLD_LOW  0.25  // 25%容量时发送恢复
 #define FLOW_CONTROL_CHECK_INTERVAL_MS 100  // 每100ms检查一次缓冲区状态
 #define MAX_BATCH_SIZE 1024
-
+// 添加WiFi监控相关定义
+#define WIFI_MONITOR_INTERVAL_MS 1000  // 每秒监控一次WiFi状态
 // #define TEST_MIC_AUDIO 1
 
 static const char *TAG = "MAIN";
@@ -59,6 +62,7 @@ static TaskHandle_t wsTaskHandle;
 static bool wsConnected = false;
 static bool flow_control_paused = false;
 static uint32_t sequence_id = 0;
+static int64_t last_retry_count = 0;   // 用于计算wifi重试增量
 
 // 音频数据结构
 typedef struct {
@@ -978,14 +982,18 @@ static void websocket_send_task(void *parameter)
                 cJSON_AddStringToObject(packet, "data", base64_data);
                 cJSON_AddNumberToObject(packet, "length", packet_data.data_length);
                 free(base64_data);
-
+                int64_t last_send_time = esp_timer_get_time() / 1000;
                 // 转换为字符串并发送
                 char *json_str = cJSON_PrintUnformatted(packet);
                 if (json_str) {
                     esp_websocket_client_send_text(client, json_str, strlen(json_str), portMAX_DELAY);
-                    ESP_LOGD(TAG, "发送音频数据: sequence=%lu, size=%d", 
-                            sequence_id - 1, packet_data.data_length);
+                    // ESP_LOGD(TAG, "发送音频数据: sequence=%lu, size=%d", 
+                    //         sequence_id - 1, packet_data.data_length);
                     free(json_str);
+                }
+                int64_t send_time = esp_timer_get_time() / 1000 - last_send_time;
+                if (send_time > 1000) {
+                    ESP_LOGE(TAG, "send time: %lld", send_time);
                 }
 
                 cJSON_Delete(packet);
@@ -1013,6 +1021,7 @@ static esp_websocket_client_handle_t init_websocket(void) {
     websocket_cfg.ping_interval_sec = 5;           // 设置 ping 间隔为5秒
     websocket_cfg.disable_pingpong_discon = false; // 启用 ping-pong 超时断开
     websocket_cfg.pingpong_timeout_sec = 10;       // 10秒没收到 pong 就断开
+    websocket_cfg.task_prio = 6;
 
     ESP_LOGI(TAG, "init_websocket Connecting to %s...", websocket_cfg.uri);
 
@@ -1042,6 +1051,48 @@ static void websocket_monitor_task(void* arg) {
         
         // 每秒检查一次连接状态
         vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+// 修改WiFi监控任务
+static void wifi_monitor_task(void* arg) {
+    uint16_t connected_count = 0;
+    int last_reconnect_count = 0;
+    
+    while (1) {
+        if (WifiStation::GetInstance().IsConnected()) {
+            // 获取RSSI和信道信息
+            int8_t rssi = WifiStation::GetInstance().GetRssi();
+            uint8_t channel = WifiStation::GetInstance().GetChannel();
+            
+            // 获取重连次数变化
+            int reconnect_delta = WifiStation::GetInstance().GetReconnectCount() - last_reconnect_count;
+            last_reconnect_count = WifiStation::GetInstance().GetReconnectCount();
+            
+            // 输出WiFi状态信息
+            ESP_LOGI(TAG, "WiFi Status - SSID: %s, IP: %s, RSSI: %d dBm, Channel: %d, Reconnects: %d/s", 
+                WifiStation::GetInstance().GetSsid().c_str(),
+                WifiStation::GetInstance().GetIpAddress().c_str(),
+                rssi,
+                channel,
+                reconnect_delta
+            );
+            
+            // 判断WiFi质量
+            if (rssi < -70) {  // RSSI低于-70dBm表示信号较弱
+                ESP_LOGW(TAG, "WiFi信号较弱 (RSSI: %d dBm)", rssi);
+            }
+            if (reconnect_delta > 0) {    // 如果发生重连
+                ESP_LOGW(TAG, "WiFi不稳定，发生重连 (%d 次)", reconnect_delta);
+            }
+            
+            connected_count++;
+        } else {
+            ESP_LOGW(TAG, "WiFi已断开连接");
+            connected_count = 0;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(WIFI_MONITOR_INTERVAL_MS));
     }
 }
 
@@ -1143,7 +1194,7 @@ void app_main(void)
     }
 
     // 创建WebSocket发送任务
-    xReturned = xTaskCreatePinnedToCore(websocket_send_task, "WSSend", 8192, NULL, 5, &wsTaskHandle, 0);
+    xReturned = xTaskCreatePinnedToCore(websocket_send_task, "WSSend", 8192, NULL, 6, &wsTaskHandle, 0);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create websocket send task");
     }
@@ -1164,6 +1215,12 @@ void app_main(void)
     xReturned = xTaskCreatePinnedToCore(websocket_monitor_task, "WSMonitor", 4096, NULL, 5, NULL, 0);
     if (xReturned != pdPASS) {
         ESP_LOGE(TAG, "Failed to create websocket monitor task");
+    }
+
+    // 在创建其他任务后添加WiFi监控任务
+    xReturned = xTaskCreatePinnedToCore(wifi_monitor_task, "WiFiMonitor", 4096, NULL, 1, NULL, 0);
+    if (xReturned != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create wifi monitor task");
     }
 
     ESP_LOGI(TAG, "All tasks created successfully");

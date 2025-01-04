@@ -1,8 +1,15 @@
+[1.2.7]
+服务器：
+1. 优化代码结构
+客户端：
+1. 增加wifi状态监控
+2. 调整websocket发送任务优先级为6、调整websocket接收任务优先级为6，这里使用时需要修改wifi_station.h的代码
+
 [1.2.6]
 服务器:
 1. 优化部分日志打印
 客户端:
-1. 增加websocket重连机制，当websocket连接断开时，自动重连
+1. 增加websocket重连机制，当websocket连接断开时，自动重连，创建任务5s检测一次
 2. 增加websocket心跳机制，当websocket连接断开时，自动重连
 
 [1.2.5]

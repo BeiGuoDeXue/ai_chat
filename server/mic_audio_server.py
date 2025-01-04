@@ -50,14 +50,10 @@ class AudioChatServer:
         self.SAMPLE_RATE = 16000
         self.BYTES_PER_SAMPLE = 2
         self.BUFFER_SIZE = self.SAMPLE_RATE * self.BYTES_PER_SAMPLE * self.BUFFER_SECONDS
-        self.PROCESS_SIZE = 128000  # 处理单位大小(约2秒的数据)
         
         # 初始化循环缓冲区
-        self.audio_buffer = deque(maxlen=self.BUFFER_SIZE)
+        self.audio_buffer = deque(maxlen=self.BUFFER_SIZE)  # 存储解码后的音频数据
         self.raw_buffer = deque()  # 存储解析后的packet_data_t小包列表
-        self.current_packet = None  # 当前正在处理的数据包
-        self.current_packet_data = []  # 当前数据包的数据
-        self.buffer_count = 0
         
         # 发送队列
         self.send_queue = asyncio.Queue(maxsize=100)
@@ -65,9 +61,6 @@ class AudioChatServer:
 
         # 初始化音频编解码器
         self.audio_codec = AudioCodec()
-        
-        # 分包大小
-        self.PACKET_SIZE = 1024
 
         # 添加锁
         self.buffer_lock = threading.Lock()
@@ -119,9 +112,6 @@ class AudioChatServer:
         # 启动处理音频的循环
         process_task = asyncio.create_task(self.process_audio_loop())
         
-        # 用于临时存储音频数据的列表
-        audio_packets = []
-        
         try:
             async for message in websocket:
                 try:
@@ -148,15 +138,8 @@ class AudioChatServer:
                             # 验证数据长度
                             if len(audio_data) == length:
                                 # print(f"收到音频数据: sequence={sequence}, size={length}")
-                                # 将音频数据添加到临时列表
-                                audio_packets.append(audio_data)
-                                
-                                # 当收集到足够的包时，一次性添加到raw_buffer
-                                if len(audio_packets) >= 1:  # 可以调整这个数值
-                                    with self.buffer_lock:
-                                        self.raw_buffer.append(audio_packets)
-                                    # print(f"存储音频包组: {len(audio_packets)}个包")
-                                    audio_packets = []  # 重置临时列表
+                                with self.buffer_lock:
+                                    self.raw_buffer.append(audio_data)
                             else:
                                 print(f"音频数据长度不匹配: 期望{length}, 实际{len(audio_data)}")
                     
@@ -274,33 +257,22 @@ class AudioChatServer:
         except Exception as e:
             print(f"发送数据包错误: {e}")
 
-    def update_buffer(self, new_data):
-        """更新循环缓冲区"""
-        for byte in new_data:
-            if self.buffer_count < self.BUFFER_SIZE:
-                self.audio_buffer.append(byte)
-                self.buffer_count += 1
-            else:
-                self.audio_buffer.popleft()
-                self.audio_buffer.append(byte)
-
     def get_process_data(self):
         """使用 WebRTC VAD 获取待处理的数据，并检测语音结束"""
         try:
-            if self.buffer_count < self.vad_detector.vad_frame_size:
+            if len(self.audio_buffer) < self.vad_detector.vad_frame_size:
                 return None
 
             # 计算要处理的数据量(不超过缓冲区大小)
-            process_size = min(self.buffer_count, self.RATE * 2)  # 处理2秒的数据
+            process_size = min(len(self.audio_buffer), self.RATE * 2)  # 处理2秒的数据
             
-            # 从缓冲区一次性提取所需数据
+            # 从缓冲区提取数据
             frame_data = bytearray(list(itertools.islice(self.audio_buffer, 0, process_size)))
             # print(f"处理数据大小: {len(frame_data)}字节, 剩余缓冲区: {self.buffer_count - len(frame_data)}字节")
             
-            # 更新缓冲区和计数
+            # 更新缓冲区
             for _ in range(len(frame_data)):
                 self.audio_buffer.popleft()
-                self.buffer_count -= 1
 
             return self.vad_detector.process_audio(frame_data)
 
@@ -310,7 +282,7 @@ class AudioChatServer:
 
     async def process_audio_loop(self):
         """定期处理音频数据的循环"""
-        # time1 = time.time()
+        time1 = time.time()
         while True:
             try:
                 if not self.test_mode:
@@ -322,7 +294,6 @@ class AudioChatServer:
 
                     if not self.data_send_complete:
                         self.audio_buffer.clear()
-                        self.buffer_count = 0
                     if self.data_send_complete_last != self.data_send_complete:
                         print("data_send_complete: ", self.data_send_complete)
                         self.data_send_complete_last = self.data_send_complete
@@ -336,7 +307,8 @@ class AudioChatServer:
                                 if len(decoded_data) > 0:
                                     # 将解码后的数据添加到临时缓冲区
                                     # temp_buffer.extend(decoded_data.tobytes())
-                                    self.update_buffer(decoded_data.tobytes())
+                                    # 将解码后的数据添加到循环缓冲区，自动处理容量限制
+                                    self.audio_buffer.extend(decoded_data.tobytes())
                                 else:
                                     print("解码后的音频数据为空")
 
@@ -353,27 +325,33 @@ class AudioChatServer:
                             if process_data:
                                 print(f"检测到语音片段，长度: {len(process_data)} 字节")
                                 # 播放语音片段
-                                self.play_audio(process_data)
+                                # self.play_audio(process_data)
                                 # current_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-                                # self.save_pcm(process_data, f"../server/audio_files/pcm/{current_time}.pcm")
-                                
-                                # 原文字转语音有的处理逻辑
-                                text = self.speech_to_text(process_data)
+                                # self.audio_saver.save_pcm(process_data, f"../server/audio_files/pcm/{current_time}.pcm")
+
+                                # 语音转文字
+                                text = self.speech_service.speech_to_text(process_data)
                                 if text:
                                     print(f"识别到的文字: {text}")
                                     # 调用大语言模型获取回复
                                     response_text = await self.get_llm_response(text)
-                                    print(f"AI回复: {response_text}")
-                                    # 
-                                    audio_data = self.text_to_speech(response_text)
+                                    if response_text:
+                                        print(f"AI回复: {response_text}")
+                                    else:
+                                        print("get_llm_response error")
+                                    # 文字转语音
+                                    audio_data = self.speech_service.text_to_speech(response_text)
                                     if audio_data:
                                         await self.send_queue.put(audio_data)
+                                    else:
+                                        print("text_to_speech error")
                                 else:
                                     print("没有识别到语音, text: ", text)
 
-                        # time2 = time.time()
-                        # print("process_audio_loop period: ", time2 - time1)
-                        # time1 = time2
+                        time2 = time.time()
+                        if time2 - time1 > 1:
+                            print("process_audio_loop period over 1s: ", time2 - time1)
+                        time1 = time2
                 else:
                     audio_data = self.read_audio("../server/audio_files/pcm/qiufeng.pcm")
                     if audio_data:
@@ -402,22 +380,6 @@ class AudioChatServer:
             print(f"发送协程发生错误: {e}")
         finally:
             print("发送协程结束")  # 添加日志信息
-
-    def speech_to_text(self, audio_data):
-        """语音转文字"""
-        return self.speech_service.speech_to_text(audio_data)
-
-    def save_pcm(self, audio_data, filename):
-        """保存PCM格式音频文件"""
-        self.audio_saver.save_pcm(audio_data, filename)
-
-    def save_wav(self, audio_data, filename):
-        """保存WAV格式音频文件"""
-        self.audio_saver.save_wav(audio_data, filename)
-
-    def text_to_speech(self, text):
-        """文字转语音"""
-        return self.speech_service.text_to_speech(text)
 
     def read_audio(self, filename):
         """读取音频文件"""

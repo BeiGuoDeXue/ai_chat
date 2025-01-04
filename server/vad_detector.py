@@ -52,8 +52,6 @@ class VadDetector:
 
             if speech_detected:
                 print("检测到语音开始")
-            else:
-                print("检测到静音")
 
             # 检查是否需要结束当前语音段
             if self.speech_started and self.vad_inactive_frames >= 15:
