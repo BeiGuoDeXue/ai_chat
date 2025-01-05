@@ -63,7 +63,7 @@ class VadDetector:
                 self.vad_inactive_frames = 0
                 
                 # 检查语音长度是否足够
-                if len(speech_data) > self.RATE * 1:  # 至少1秒的语音
+                if len(speech_data) > self.RATE * 1.5:  # 至少1.5秒的语音
                     print(f"返回语音片段，长度: {len(speech_data)}字节")
                     return speech_data
                 else:

@@ -40,10 +40,10 @@ static const char *TAG = "MAIN";
 
 // WebSocket配置
 static esp_websocket_client_handle_t client = NULL;
-static const char* WS_URI = "ws://192.168.31.79:80/ws/esp32-client";
+static const char* WS_URI = "ws://192.168.32.138:80/ws/esp32-client";
 
 // WiFi配置
-#define WIFI_SSID "2806"
+#define WIFI_SSID "zhaokangxu"
 #define WIFI_PASS "zhaokangxu"
 
 // Opus编码器
@@ -63,6 +63,30 @@ static bool wsConnected = false;
 static bool flow_control_paused = false;
 static uint32_t sequence_id = 0;
 static int64_t last_retry_count = 0;   // 用于计算wifi重试增量
+static bool is_speaking = false;
+
+// 定义状态
+typedef enum {
+    CHAT_STATE_INIT = 0,        // 初始化状态
+    CHAT_STATE_UPGRADE,         // 升级状态
+    CHAT_STATE_CONNECTING,      // 网络连接状态
+    CHAT_STATE_IDLE,           // 空闲状态
+    CHAT_STATE_LISTENING,      // 录音/唤醒词状态
+    CHAT_STATE_SPEAKING,       // 播放状态
+    CHAT_STATE_ERROR           // 故障状态
+} chat_state_t;
+
+// 状态机相关变量
+static chat_state_t current_state = CHAT_STATE_INIT;
+static const char* const STATE_STRINGS[] = {
+    "init",
+    "upgrade",
+    "connecting",
+    "idle",
+    "listening",
+    "speaking",
+    "error"
+};
 
 // 音频数据结构
 typedef struct {
@@ -139,8 +163,14 @@ static const unsigned char base64_table[256] = {
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64
 };
-
+// 函数声明
 static esp_websocket_client_handle_t init_websocket(void);
+static void set_chat_state(chat_state_t new_state);
+static bool can_transition_to(chat_state_t target_state);
+static bool try_transition_to(chat_state_t target_state);
+static chat_state_t get_chat_state(void);
+
+// 函数定义
 
 // Base64解码函数
 static unsigned char* base64_decode(const unsigned char* input, size_t input_len, size_t* output_len) {
@@ -360,6 +390,34 @@ static size_t audio_ring_buffer_read(audio_ring_buffer_t *rb, uint8_t *data, siz
     return read_len;
 }
 
+// 添加缓冲区重置函数声明
+static void audio_ring_buffer_reset(audio_ring_buffer_t *rb) {
+    if (xSemaphoreTake(rb->mutex, portMAX_DELAY) == pdTRUE) {
+        rb->read_pos = 0;
+        rb->write_pos = 0;
+        rb->data_size = 0;
+        xSemaphoreGive(rb->mutex);
+    }
+}
+
+static void decoded_packets_buffer_reset(decoded_packets_buffer_t *rb) {
+    if (xSemaphoreTake(rb->mutex, portMAX_DELAY) == pdTRUE) {
+        rb->read_pos = 0;
+        rb->write_pos = 0;
+        rb->packet_count = 0;
+        xSemaphoreGive(rb->mutex);
+    }
+}
+
+static void encoded_packets_buffer_reset(encoded_packets_buffer_t *rb) {
+    if (xSemaphoreTake(rb->mutex, portMAX_DELAY) == pdTRUE) {
+        rb->read_pos = 0;
+        rb->write_pos = 0;
+        rb->packet_count = 0;
+        xSemaphoreGive(rb->mutex);
+    }
+}
+
 // 初始化Opus编码器和解码器
 static esp_err_t init_opus(void) {
     int err;
@@ -458,6 +516,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
             ESP_LOGI(TAG, "WEBSOCKET_EVENT_CONNECTED");
+            try_transition_to(CHAT_STATE_IDLE);
             wsConnected = true;
             break;
             
@@ -468,6 +527,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                 message_buffer = NULL;
             }
             message_len = 0;
+            try_transition_to(CHAT_STATE_CONNECTING);
             wsConnected = false;
             break;
 
@@ -602,6 +662,20 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                                 last_time = current_time;
                             }
                         }
+                        else if (strcmp(type->valuestring, "control") == 0) {
+                            cJSON *action = cJSON_GetObjectItem(root, "action");
+                            if (action && cJSON_IsString(action)) {
+                                if (strcmp(action->valuestring, "start_playing") == 0) {
+                                    // 收到开始播放指令，切换到播放状态
+                                    try_transition_to(CHAT_STATE_SPEAKING);
+                                    is_speaking = true;
+                                }
+                                else if (strcmp(action->valuestring, "stop_playing") == 0) {
+                                    // 收到停止播放指令，切换到录音状态
+                                    is_speaking = false;
+                                }
+                            }
+                        }
                     }
                     cJSON_Delete(root);
                 } else {
@@ -619,6 +693,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         }
         case WEBSOCKET_EVENT_ERROR:
             ESP_LOGE(TAG, "WEBSOCKET_EVENT_ERROR");
+            try_transition_to(CHAT_STATE_CONNECTING);
             break;
     }
 }
@@ -630,6 +705,12 @@ static void audio_input_task(void *parameter)
     size_t bytes_read;
     int64_t last_time = 0;
     while (1) {
+        // 只在LISTENING状态下录音
+        if (get_chat_state() != CHAT_STATE_LISTENING) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         // 读取一次数据（阻塞式）
         esp_err_t ret = read_mic_data(inputData.buffer, 
                                     sizeof(inputData.buffer), 
@@ -674,6 +755,12 @@ static void audio_output_task(void *parameter)
     size_t bytes_written;
     max98357_open();
     while (1) {
+        // 只在SPEAKING状态下播放
+        if (get_chat_state() != CHAT_STATE_SPEAKING) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         // 等待解码数据就绪
         if (xSemaphoreTake(audio_ring_buffer.data_ready, portMAX_DELAY) == pdTRUE) {
             // 持续读取并输出数据，直到缓冲区为空
@@ -798,6 +885,8 @@ static void audio_encode_task(void *parameter)
             // 编码
             int encoded_size = opus_encode(encoder, inputData.buffer, OPUS_FRAME_SIZE, 
                                         packet_data.data, sizeof(packet_data.data));
+            // int encoded_size = 1;
+            // packet_data.data[0] = 0;
             if (encoded_size < 0) {
                 ESP_LOGE(TAG, "Opus编码错误: %d", encoded_size);
                 continue;
@@ -986,9 +1075,15 @@ static void websocket_send_task(void *parameter)
                 // 转换为字符串并发送
                 char *json_str = cJSON_PrintUnformatted(packet);
                 if (json_str) {
-                    esp_websocket_client_send_text(client, json_str, strlen(json_str), portMAX_DELAY);
-                    // ESP_LOGD(TAG, "发送音频数据: sequence=%lu, size=%d", 
-                    //         sequence_id - 1, packet_data.data_length);
+                    // 添加超时控制，不使用 portMAX_DELAY
+                    const int SEND_TIMEOUT_MS = 1000; // 1秒超时
+                    int ret = esp_websocket_client_send_text(client, 
+                                                           json_str, 
+                                                           strlen(json_str), 
+                                                           portMAX_DELAY);
+                    if (ret < 0) {
+                        ESP_LOGW(TAG, "发送失败，错误码：%d", ret);
+                    }
                     free(json_str);
                 }
                 int64_t send_time = esp_timer_get_time() / 1000 - last_send_time;
@@ -1017,7 +1112,7 @@ static esp_websocket_client_handle_t init_websocket(void) {
     websocket_cfg.reconnect_timeout_ms = 3000;     // 减少重连超时时间到3秒
     websocket_cfg.network_timeout_ms = 5000;       // 减少网络超时时间到5秒
     websocket_cfg.disable_auto_reconnect = false;  // 保持自动重连开启
-    websocket_cfg.buffer_size = 2048;
+    websocket_cfg.buffer_size = 4096;
     websocket_cfg.ping_interval_sec = 5;           // 设置 ping 间隔为5秒
     websocket_cfg.disable_pingpong_discon = false; // 启用 ping-pong 超时断开
     websocket_cfg.pingpong_timeout_sec = 10;       // 10秒没收到 pong 就断开
@@ -1037,7 +1132,7 @@ static void websocket_monitor_task(void* arg) {
     while (1) {
         if (!wsConnected || !esp_websocket_client_is_connected(client)) {
             ESP_LOGW(TAG, "WebSocket连接断开或未连接，尝试重新连接...");
-            
+            wsConnected = false;
             // 停止当前的WebSocket客户端
             esp_websocket_client_stop(client);
             esp_websocket_client_destroy(client);
@@ -1070,7 +1165,7 @@ static void wifi_monitor_task(void* arg) {
             last_reconnect_count = WifiStation::GetInstance().GetReconnectCount();
             
             // 输出WiFi状态信息
-            ESP_LOGI(TAG, "WiFi Status - SSID: %s, IP: %s, RSSI: %d dBm, Channel: %d, Reconnects: %d/s", 
+            ESP_LOGD(TAG, "WiFi Status - SSID: %s, IP: %s, RSSI: %d dBm, Channel: %d, Reconnects: %d/s", 
                 WifiStation::GetInstance().GetSsid().c_str(),
                 WifiStation::GetInstance().GetIpAddress().c_str(),
                 rssi,
@@ -1093,6 +1188,186 @@ static void wifi_monitor_task(void* arg) {
         }
         
         vTaskDelay(pdMS_TO_TICKS(WIFI_MONITOR_INTERVAL_MS));
+    }
+}
+
+static chat_state_t get_chat_state(void) {
+    return current_state;
+}
+
+// 状态转换函数，动作执行
+static void set_chat_state(chat_state_t new_state) {
+    if (current_state == new_state) {
+        return;
+    }
+    
+    ESP_LOGW(TAG, "状态转换: %s -> %s", 
+             STATE_STRINGS[current_state], 
+             STATE_STRINGS[new_state]);
+    current_state = new_state;
+
+    // 进入新状态的初始化工作
+    switch (new_state) {
+        case CHAT_STATE_INIT:
+            // 初始化硬件
+            break;
+            
+        case CHAT_STATE_UPGRADE:
+            // 准备升级
+            break;
+            
+        case CHAT_STATE_CONNECTING:
+            // 初始化网络连接
+            // 有地方会处理重连，这里不处理
+            break;
+            
+        case CHAT_STATE_IDLE:
+            // 重置音频缓冲区
+            xQueueReset(audioEncodeQueue);
+            // 重置解码环形缓冲区
+            decoded_packets_buffer_reset(&decoded_packets_buffer);
+            // 重置音频输出环形缓冲区
+            audio_ring_buffer_reset(&audio_ring_buffer);
+            // 重置编码环形缓冲区
+            encoded_packets_buffer_reset(&encoded_packets_buffer);
+            break;
+            
+        case CHAT_STATE_LISTENING:
+            // 启动录音
+            xQueueReset(audioEncodeQueue);
+            break;
+            
+        case CHAT_STATE_SPEAKING:
+            // 准备播放
+            break;
+            
+        case CHAT_STATE_ERROR:
+            ESP_LOGE(TAG, "系统进入故障状态");
+            break;
+        default:
+            break;
+    }
+}
+
+// 状态转换条件检查函数
+static bool can_transition_to(chat_state_t target_state) {
+    switch (current_state) {
+        case CHAT_STATE_INIT:
+            // T1: 只能转到升级状态
+            return target_state == CHAT_STATE_UPGRADE;
+            
+        case CHAT_STATE_UPGRADE:
+            // T2: 只能转到网络连接状态
+            return target_state == CHAT_STATE_CONNECTING;
+            
+        case CHAT_STATE_CONNECTING:
+            // T3: 可以转到空闲状态
+            // T4: 连接失败可以重试
+            return target_state == CHAT_STATE_IDLE || 
+                   target_state == CHAT_STATE_CONNECTING;
+            
+        case CHAT_STATE_IDLE:
+            // T5: 可以转到录音状态
+            // T6: 可以转到播放状态
+            // T7: 可以转到网络连接状态
+            return target_state == CHAT_STATE_LISTENING ||
+                   target_state == CHAT_STATE_SPEAKING || 
+                   target_state == CHAT_STATE_CONNECTING;
+            
+        case CHAT_STATE_LISTENING:
+            // T6: 可以转回空闲状态
+            // T7: 可以转到播放状态
+            // T8: 可以转到网络连接状态
+            return target_state == CHAT_STATE_IDLE || 
+                   target_state == CHAT_STATE_SPEAKING || 
+                   target_state == CHAT_STATE_CONNECTING;
+            
+        case CHAT_STATE_SPEAKING:
+            // T8: 可以转到录音状态
+            // T9: 可以转到空闲状态
+            // T10: 可以继续播放
+            return target_state == CHAT_STATE_LISTENING || 
+                   target_state == CHAT_STATE_IDLE || 
+                   target_state == CHAT_STATE_SPEAKING;
+        default:
+            break;
+    }
+    
+    // T11: 任何状态都可以转到故障状态
+    return target_state == CHAT_STATE_ERROR;
+}
+
+// 尝试转换状态
+static bool try_transition_to(chat_state_t target_state) {
+    if (!can_transition_to(target_state)) {
+        ESP_LOGE(TAG, "非法状态转换: %s -> %s", 
+                 STATE_STRINGS[current_state], 
+                 STATE_STRINGS[target_state]);
+        return false;
+    }
+    
+    set_chat_state(target_state);
+    return true;
+}
+
+// 状态机切换任务
+static void state_machine_task(void* arg) {
+    while (1) {
+        // 轮询状态监控
+        
+        // 1、检查WebSocket连接状态
+        if (!wsConnected || !esp_websocket_client_is_connected(client)) {
+            wsConnected = false;
+        }
+
+        //2、检测wifi连接状态
+        bool wifi_connected = false;
+        if (WifiStation::GetInstance().IsConnected()) {
+            wifi_connected = true;
+        }
+
+        // 根据当前状态执行相应的操作
+        switch (current_state) {
+            case CHAT_STATE_LISTENING:
+                if (!wsConnected) {
+                    try_transition_to(CHAT_STATE_CONNECTING);
+                }
+
+                if (decoded_packets_buffer.packet_count > 0) {
+                    try_transition_to(CHAT_STATE_SPEAKING);
+                }
+                // 执行监听状态的操作
+                break;
+            case CHAT_STATE_SPEAKING:
+                if (!wsConnected) {
+                    try_transition_to(CHAT_STATE_CONNECTING);
+                }
+                if (!is_speaking && decoded_packets_buffer.packet_count == 0 && audio_ring_buffer.data_size == 0) {
+                    try_transition_to(CHAT_STATE_LISTENING);
+                }
+                // 执行说话状态的操作
+                break;
+            case CHAT_STATE_IDLE:
+                if (!wsConnected) {
+                    try_transition_to(CHAT_STATE_CONNECTING);
+                }
+                if (decoded_packets_buffer.packet_count > 0) {
+                    try_transition_to(CHAT_STATE_SPEAKING);
+                }
+                if (!is_speaking && decoded_packets_buffer.packet_count == 0 && audio_ring_buffer.data_size == 0) {
+                    try_transition_to(CHAT_STATE_LISTENING);
+                }
+                // 执行空闲状态的操作
+                break;
+            case CHAT_STATE_CONNECTING:
+                if (wsConnected) {
+                    try_transition_to(CHAT_STATE_IDLE);
+                }
+                break;
+            default:
+                break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -1199,11 +1474,11 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to create websocket send task");
     }
 
-    // 创建监控任务
-    xReturned = xTaskCreatePinnedToCore(monitor_task, "monitor", 4096, NULL, 1, NULL, 0);
-    if (xReturned != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create monitor task");
-    }
+    // // 创建监控任务
+    // xReturned = xTaskCreatePinnedToCore(monitor_task, "monitor", 4096, NULL, 1, NULL, 0);
+    // if (xReturned != pdPASS) {
+    //     ESP_LOGE(TAG, "Failed to create monitor task");
+    // }
 
     // 创建流控制任务
     xReturned = xTaskCreatePinnedToCore(flow_control_task, "flow_control", 4096, NULL, 5, NULL, 0);
@@ -1223,7 +1498,15 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to create wifi monitor task");
     }
 
+    // 创建状态机切换任务
+    xReturned = xTaskCreatePinnedToCore(state_machine_task, "StateMachine", 4096, NULL, 5, NULL, 0);
+    if (xReturned != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create state machine task");
+    }
+
     ESP_LOGI(TAG, "All tasks created successfully");
+    // 初始化状态
+    set_chat_state(CHAT_STATE_IDLE);
 }
 
 // 添加资源清理函数（可以在需要时调用）

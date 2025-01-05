@@ -103,6 +103,9 @@ class AudioChatServer:
             rate=self.RATE
         )
 
+        # 临时全局变量
+        self.websocket_handle_last_time = 0
+
     async def handle_websocket(self, websocket):
         """处理WebSocket连接"""
         print("新客户端连接!")
@@ -111,7 +114,7 @@ class AudioChatServer:
         send_task = asyncio.create_task(self.send_worker(websocket))
         # 启动处理音频的循环
         process_task = asyncio.create_task(self.process_audio_loop())
-        
+
         try:
             async for message in websocket:
                 try:
@@ -130,18 +133,20 @@ class AudioChatServer:
                             self.pause_event.set()
                             print("收到恢复请求")
                     elif data.get('type') == 'audio_batch':
-                        if self.data_send_complete:
-                            sequence = data.get('sequence')
-                            audio_data = base64.b64decode(data.get('data', ''))
-                            length = data.get('length', 0)
+                        sequence = data.get('sequence')
+                        audio_data = base64.b64decode(data.get('data', ''))
+                        length = data.get('length', 0)
 
-                            # 验证数据长度
-                            if len(audio_data) == length:
-                                # print(f"收到音频数据: sequence={sequence}, size={length}")
-                                with self.buffer_lock:
-                                    self.raw_buffer.append(audio_data)
-                            else:
-                                print(f"音频数据长度不匹配: 期望{length}, 实际{len(audio_data)}")
+                        # 验证数据长度
+                        if len(audio_data) == length:
+                            # print(f"收到音频数据: sequence={sequence}, size={length}")
+                            with self.buffer_lock:
+                                self.raw_buffer.append([audio_data])
+                        else:
+                            print(f"音频数据长度不匹配: 期望{length}, 实际{len(audio_data)}")
+                        # current_time = time.time()
+                        # print(f"websocket_handle_last_time: {current_time - self.websocket_handle_last_time}")
+                        # self.websocket_handle_last_time = current_time
                     
                 except json.JSONDecodeError as e:
                     print(f"JSON解析错误: {e}, 消息内容: {message[:100]}")
@@ -175,6 +180,13 @@ class AudioChatServer:
             current_batch = []
             current_size = 0
             batch_number = 0
+            # 发送开始播放控制消息
+            start_control = {
+                "type": "control",
+                "action": "start_playing"
+            }
+            await websocket.send(json.dumps(start_control))
+            print("发送开始播放控制消息")
             self.data_send_complete = False
             print("开始发送音频数据, 数据包数量: ", len(encoded_packets))
             for packet in encoded_packets:
@@ -193,7 +205,7 @@ class AudioChatServer:
                 packet_size = len(json_data.encode('utf-8'))
                 
                 # 如果添加这个包会超过512字节，先发送当前批次
-                if current_size + packet_size > 1024 and current_batch:
+                if current_size + packet_size > 512 and current_batch:
                     batch_data = {
                         "type": "audio_batch",
                         "sequence": self.sequence_id,
@@ -204,8 +216,8 @@ class AudioChatServer:
                     
                     try:
                         await websocket.send(json.dumps(batch_data))
-                        # print(f"发送批次 {batch_number}: {len(current_batch)}个包, "
-                        #       f"sequence={self.sequence_id}, size={current_size}字节")
+                        print(f"发送批次 {batch_number}: {len(current_batch)}个包, "
+                              f"sequence={self.sequence_id}, size={current_size}字节")
                         
                         # 重置当前批次
                         current_batch = []
@@ -214,7 +226,7 @@ class AudioChatServer:
                         self.sequence_id += 1
                         
                         # 控制发送速率
-                        await asyncio.sleep(0.2)  # 50ms间隔
+                        await asyncio.sleep(0.1)  # 50ms间隔
 
                     except websockets.exceptions.ConnectionClosed:
                         print("WebSocket连接已关闭")
@@ -251,7 +263,16 @@ class AudioChatServer:
                 except Exception as e:
                     print(f"发送最后批次失败: {e}")
             print("发送音频数据完成")
-            await asyncio.sleep(4)  # 发送完成后等待2s用于喇叭播放
+            
+            # 发送停止播放控制消息
+            stop_control = {
+                "type": "control",
+                "action": "stop_playing"
+            }
+            await websocket.send(json.dumps(stop_control))
+            print("发送停止播放控制消息")
+            
+            await asyncio.sleep(0.5)  # 给客户端一些处理时间
             self.data_send_complete = True
 
         except Exception as e:
@@ -324,8 +345,11 @@ class AudioChatServer:
                             process_data = self.get_process_data()
                             if process_data:
                                 print(f"检测到语音片段，长度: {len(process_data)} 字节")
+                                # 清空缓冲区
+                                self.audio_buffer.clear()
+                                self.raw_buffer.clear()
                                 # 播放语音片段
-                                # self.play_audio(process_data)
+                                self.play_audio(process_data)
                                 # current_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
                                 # self.audio_saver.save_pcm(process_data, f"../server/audio_files/pcm/{current_time}.pcm")
 
