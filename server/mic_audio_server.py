@@ -17,11 +17,12 @@ from audio_analyzer import analyze_audio_energy
 import itertools
 import datetime
 import queue
-from audio_recorder import AudioRecorder
 from audio_player import AudioPlayer
 from speech_service import SpeechService
 from audio_saver import AudioSaver
 from vad_detector import VadDetector
+from queue import Queue
+import concurrent.futures
 
 # 设置控制台输出编码
 if sys.platform == 'win32':
@@ -33,10 +34,7 @@ class AudioChatServer:
     def __init__(self):
         # 初始化语音服务
         self.speech_service = SpeechService()
-        
-        # 初始化录音器
-        self.recorder = AudioRecorder()
-        
+
         # 音频配置
         self.CHUNK = 1024
         self.FORMAT = pyaudio.paInt16
@@ -45,30 +43,15 @@ class AudioChatServer:
         
         # 初始化音频编解码器
         self.audio_codec = AudioCodec()
-        # 循环缓冲区配置
-        self.BUFFER_SECONDS = 10
-        self.SAMPLE_RATE = 16000
-        self.BYTES_PER_SAMPLE = 2
-        self.BUFFER_SIZE = self.SAMPLE_RATE * self.BYTES_PER_SAMPLE * self.BUFFER_SECONDS
         
-        # 初始化循环缓冲区
-        self.audio_buffer = deque(maxlen=self.BUFFER_SIZE)  # 存储解码后的音频数据
-        self.raw_buffer = deque()  # 存储解析后的packet_data_t小包列表
+        # 用于线程间通信的队列
+        self.audio_queue = Queue()        # 原始音频数据队列
+        self.result_queue = Queue()       # 处理后的音频数据队列
+        self.send_queue = Queue()         # 发送队列
         
-        # 发送队列
-        self.send_queue = asyncio.Queue(maxsize=100)
-        self.is_processing = False
-
-        # 初始化音频编解码器
-        self.audio_codec = AudioCodec()
-
-        # 添加锁
-        self.buffer_lock = threading.Lock()
-
-        # 数据发送完成
-        self.data_send_complete = True
-        self.data_send_complete_last = False
-
+        # 线程控制标志
+        self.running = True
+        
         # 初始化LLM客户端
         self.zhipu_client = ZhipuClient(
             server_host="qzvdrb.natappfree.cc",
@@ -83,17 +66,8 @@ class AudioChatServer:
 
         # 初始化 VAD 检测器
         self.vad_detector = VadDetector(sample_rate=self.RATE)
-        # 初始化包序列号
-        self.sequence_id = 0
-        # 添加流控制相关的属性
-        self.flow_control_paused = False
-        self.pause_event = asyncio.Event()
-        self.pause_event.set()  # 初始状态为未暂停
-
-        # 测试模式
-        self.test_mode = False
-
-        # 初始化音频播放器
+        
+        # 初始化音频播放器和保存器
         self.player = AudioPlayer()
 
         # 初始化音频保存器
@@ -102,37 +76,144 @@ class AudioChatServer:
             sample_format=self.FORMAT,
             rate=self.RATE
         )
+        
+        # 添加 Event 用于流控制
+        self.flow_control_event = asyncio.Event()
+        self.flow_control_event.set()  # 默认设置为可发送状态
 
-        # 临时全局变量
-        self.websocket_handle_last_time = 0
+        # 发送完成信号
+        self.send_data_complete = True
+        
+        # 修改 flow_control_paused 的处理
+        
+        self.flow_control_paused = False
+        self._websocket_lock = threading.Lock()
+        self._current_websocket = None
+
+        # 创建并启动线程
+        self.start_threads()
+
+        self.loop = None  # 添加事件循环引用
+
+        self.test_play_music_mode = False  # 添加测试模式标志
+        self.test_reply_mode = False  # 添加测试模式标志
+        self.play_test_audio = True
+
+    def start_threads(self):
+        """创建并启动所有工作线程"""
+        # 语音服务线程
+        self.speech_thread = threading.Thread(
+            target=self.speech_service_worker,
+            name="Speech-Service"
+        )
+        
+        # 发送线程
+        self.send_thread = threading.Thread(
+            target=self.send_worker,
+            name="Send-Worker"
+        )
+        
+        # 设置为守护线程
+        self.speech_thread.daemon = True
+        self.send_thread.daemon = True
+        
+        # 启动所有线程
+        self.speech_thread.start()
+        self.send_thread.start()
+
+    def speech_service_worker(self):
+        """处理语音服务的线程"""
+        time0 = time.time()
+        while self.running:
+            try:
+                audio_chunks = []
+                # 一次性读取所有可用数据
+                while True:
+                    try:
+                        audio_data = self.result_queue.get_nowait()
+                        if audio_data is None:
+                            return
+                        audio_chunks.append(audio_data)
+                    except queue.Empty:
+                        break
+
+                if not audio_chunks:
+                    time.sleep(0.1)  # 避免空转
+                    continue
+
+                # 合并音频数据
+                combined_audio = b''.join(audio_chunks)
+                if not self.send_data_complete:
+                    print("发送中，清空结果队列")
+                    # self.result_queue
+                    continue
+                if self.test_play_music_mode:
+                    audio_data = self.read_audio("../server/audio_files/pcm/qiufeng.pcm")
+                    if audio_data:
+                        self.send_queue.put(audio_data)
+                    continue
+
+                try:
+                    # VAD检测
+                    processed_audio = self.vad_detector.process_audio(combined_audio)
+                    if processed_audio:
+                        if self.test_reply_mode:
+                            # 测试模式：直接回放音频
+                            self.send_queue.put(processed_audio)
+                        else:
+                            # 播放音频（如果需要）
+                            if self.play_test_audio and self.player:
+                                self.player.play_audio(processed_audio)
+                            # 正常模式：语音识别和处理
+                            text = self.speech_service.speech_to_text(processed_audio)
+                            if text:
+                                print(f"识别到的文字: {text}")
+                                response = self.get_llm_response_sync(text)
+                                if response:
+                                    print(f"AI回复: {response}")
+                                    audio = self.speech_service.text_to_speech(response)
+                                    if audio:
+                                        self.send_queue.put(audio)
+                                    else:
+                                        print("text_to_speech 失败")
+                                else:
+                                    print("AI回复为空")
+                            else:
+                                print("语音识别失败")
+                except Exception as e:
+                    print(f"语音服务错误: {e}")
+                
+                time1 = time.time()
+                if time1 - time0 > 1:
+                    print("loop 1s")
+                    time0 = time1
+            except Exception as e:
+                print(f"语音处理线程错误: {e}")
 
     async def handle_websocket(self, websocket):
-        """处理WebSocket连接"""
-        print("新客户端连接!")
-        
-        # 启动发送协程
-        send_task = asyncio.create_task(self.send_worker(websocket))
-        # 启动处理音频的循环
-        process_task = asyncio.create_task(self.process_audio_loop())
-
+        """WebSocket消息处理"""
         try:
+            # 保存当前 websocket 连接
+            self.current_websocket = websocket
+            print(f"新的WebSocket连接已建立: {id(websocket)}")  # 添加日志
+            
             async for message in websocket:
                 try:
-                    # 解析JSON消息
-                    if isinstance(message, bytes):
-                        message = message.decode('utf-8')
-                    
                     data = json.loads(message)
                     
+                    # 处理流控制消息
                     if data.get('type') == 'flow_control':
-                        self.flow_control_paused = data.get('pause', False)
-                        if self.flow_control_paused:
-                            self.pause_event.clear()
-                            print("收到暂停请求")
-                        else:
-                            self.pause_event.set()
-                            print("收到恢复请求")
-                    elif data.get('type') == 'audio_batch':
+                        if 'pause' in data:
+                            self.flow_control_paused = data['pause']
+                            if self.flow_control_paused:
+                                self.flow_control_event.clear()
+                            else:
+                                self.flow_control_event.set()
+                            print(f"收到流控制消息: {'暂停' if self.flow_control_paused else '继续'} 发送")
+                        continue
+                    
+                    # 处理音频数据
+                    if data.get('type') == 'audio_batch':
                         sequence = data.get('sequence')
                         audio_data = base64.b64decode(data.get('data', ''))
                         length = data.get('length', 0)
@@ -140,270 +221,106 @@ class AudioChatServer:
                         # 验证数据长度
                         if len(audio_data) == length:
                             # print(f"收到音频数据: sequence={sequence}, size={length}")
-                            with self.buffer_lock:
-                                self.raw_buffer.append([audio_data])
+                            try:
+                                # 解码音频
+                                decoded_data, _ = self.audio_codec.decode_audio([audio_data])
+                                if len(decoded_data) > 0:
+                                    # 直接放入结果队列供语音服务处理
+                                    self.result_queue.put(decoded_data.tobytes())
+                            except Exception as e:
+                                print(f"处理音频包错误: {e}")
                         else:
-                            print(f"音频数据长度不匹配: 期望{length}, 实际{len(audio_data)}")
-                        # current_time = time.time()
-                        # print(f"websocket_handle_last_time: {current_time - self.websocket_handle_last_time}")
-                        # self.websocket_handle_last_time = current_time
-                    
+                            print(f"音频数据长度不匹配: 收到={len(audio_data)}, 预期={length}")
+
                 except json.JSONDecodeError as e:
                     print(f"JSON解析错误: {e}, 消息内容: {message[:100]}")
                 except Exception as e:
                     print(f"处理消息错误: {type(e).__name__}: {str(e)}")
-                
+
         except websockets.exceptions.ConnectionClosed:
-            print("客户端断开连接")
+            print("WebSocket连接关闭")
         finally:
-            send_task.cancel()
-            process_task.cancel()
+            print(f"WebSocket连接断开: {id(websocket)}")  # 添加日志
+            self.current_websocket = None
+
+    def send_worker(self):
+        """处理发送队列的线程"""
+        while self.running:
             try:
-                await send_task
-                await process_task
-            except asyncio.CancelledError:
-                pass
-            print("WebSocket连接已关闭")
-
-    async def send_audio_packets(self, websocket, audio_data):
-        """使用JSON格式发送音频数据"""
-        try:
-            if websocket.closed:
-                print("WebSocket未连接，无法发送数据")
-                return
-            
-            # 1. 将音频数据编码成opus包
-            audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            encoded_packets, _ = self.audio_codec.encode_audio(audio_array)
-            
-            # 2. 将数据包分批处理
-            current_batch = []
-            current_size = 0
-            batch_number = 0
-            # 发送开始播放控制消息
-            start_control = {
-                "type": "control",
-                "action": "start_playing"
-            }
-            await websocket.send(json.dumps(start_control))
-            print("发送开始播放控制消息")
-            self.data_send_complete = False
-            print("开始发送音频数据, 数据包数量: ", len(encoded_packets))
-            for packet in encoded_packets:
-                # 等待恢复发送信号
-                await self.pause_event.wait()
-                
-                # 计算当前包的JSON大小
-                packet_data = {
-                    "type": "audio",
-                    "sequence": self.sequence_id,
-                    "batch": batch_number,
-                    "data": base64.b64encode(packet).decode('utf-8'),
-                    "length": len(packet)
-                }
-                json_data = json.dumps(packet_data)
-                packet_size = len(json_data.encode('utf-8'))
-                
-                # 如果添加这个包会超过512字节，先发送当前批次
-                if current_size + packet_size > 512 and current_batch:
-                    batch_data = {
-                        "type": "audio_batch",
-                        "sequence": self.sequence_id,
-                        "batch": batch_number,
-                        "total_packets": len(current_batch),
-                        "packets": current_batch
-                    }
+                # 从发送队列获取音频数据
+                audio_data = self.send_queue.get(timeout=1)
+                if audio_data is None:
+                    break
                     
-                    try:
-                        await websocket.send(json.dumps(batch_data))
-                        print(f"发送批次 {batch_number}: {len(current_batch)}个包, "
-                              f"sequence={self.sequence_id}, size={current_size}字节")
-                        
-                        # 重置当前批次
-                        current_batch = []
-                        current_size = 0
-                        batch_number += 1
-                        self.sequence_id += 1
-                        
-                        # 控制发送速率
-                        await asyncio.sleep(0.1)  # 50ms间隔
-
-                    except websockets.exceptions.ConnectionClosed:
-                        print("WebSocket连接已关闭")
-                        return
-                    except Exception as e:
-                        print(f"发送数据包失败: {e}")
-                        continue
-                
-                # 添加当前包到批次
-                current_batch.append({
-                    "data": base64.b64encode(packet).decode('utf-8'),
-                    "length": len(packet)
-                })
-                current_size += packet_size
-            
-            # 发送最后一批（如果有）
-            if current_batch:
-                batch_data = {
-                    "type": "audio_batch",
-                    "sequence": self.sequence_id,
-                    "batch": batch_number,
-                    "total_packets": len(current_batch),
-                    "packets": current_batch
-                }
-                
-                try:
-                    await websocket.send(json.dumps(batch_data))
-                    print(f"发送最后批次 {batch_number}: {len(current_batch)}个包, "
-                          f"sequence={self.sequence_id}, size={current_size}字节")
-                    self.sequence_id += 1
+                # 增加更详细的连接状态检查
+                if not self.current_websocket:
+                    print("WebSocket实例不存在")
+                    continue
                     
-                except websockets.exceptions.ConnectionClosed:
-                    print("WebSocket连接已关闭")
-                except Exception as e:
-                    print(f"发送最后批次失败: {e}")
-            print("发送音频数据完成")
-            
-            # 发送停止播放控制消息
-            stop_control = {
-                "type": "control",
-                "action": "stop_playing"
-            }
-            await websocket.send(json.dumps(stop_control))
-            print("发送停止播放控制消息")
-            
-            await asyncio.sleep(0.5)  # 给客户端一些处理时间
-            self.data_send_complete = True
+                if not hasattr(self.current_websocket, 'open'):
+                    print("WebSocket实例无效")
+                    continue
+                    
+                print(f"当前WebSocket状态: {self.current_websocket.open}, ID: {id(self.current_websocket)}")
+                
+                if self.current_websocket and self.current_websocket.open:
+                    print(f"准备发送音频数据: {len(audio_data)}字节")
+                    if self.loop:
+                        try:
+                            future = asyncio.run_coroutine_threadsafe(
+                                self.send_audio_packets(self.current_websocket, audio_data),
+                                self.loop
+                            )
+                            # 添加超时机制
+                            future.result(timeout=10)  # 10秒超时
+                            print("音频数据发送完成")
+                        except concurrent.futures.TimeoutError:
+                            print("发送音频数据超时")
+                        except Exception as e:
+                            print(f"发送音频数据时发生错误: {e}")
+                    else:
+                        print("事件循环未初始化")
+                else:
+                    print("WebSocket未连接")
 
-        except Exception as e:
-            print(f"发送数据包错误: {e}")
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"发送线程错误: {e}")
 
-    def get_process_data(self):
-        """使用 WebRTC VAD 获取待处理的数据，并检测语音结束"""
+    def get_llm_response_sync(self, text: str) -> str:
+        """同步方式获取LLM响应"""
         try:
-            if len(self.audio_buffer) < self.vad_detector.vad_frame_size:
-                return None
-
-            # 计算要处理的数据量(不超过缓冲区大小)
-            process_size = min(len(self.audio_buffer), self.RATE * 2)  # 处理2秒的数据
-            
-            # 从缓冲区提取数据
-            frame_data = bytearray(list(itertools.islice(self.audio_buffer, 0, process_size)))
-            # print(f"处理数据大小: {len(frame_data)}字节, 剩余缓冲区: {self.buffer_count - len(frame_data)}字节")
-            
-            # 更新缓冲区
-            for _ in range(len(frame_data)):
-                self.audio_buffer.popleft()
-
-            return self.vad_detector.process_audio(frame_data)
-
+            if self.current_llm == "zhipu":
+                return asyncio.run(self.zhipu_client.get_response(text))
+            else:
+                return asyncio.run(self.volcengine_client.get_response(text))
         except Exception as e:
-            print(f"处理音频数据时发生错误: {e}")
+            print(f"获取LLM响应错误: {e}")
             return None
 
-    async def process_audio_loop(self):
-        """定期处理音频数据的循环"""
-        time1 = time.time()
-        while True:
-            try:
-                if not self.test_mode:
-                    encoded_packets = []
-                    # 使用锁保护raw_buffer的读取
-                    with self.buffer_lock:
-                        while self.raw_buffer:
-                            encoded_packets.extend(self.raw_buffer.popleft())
-
-                    if not self.data_send_complete:
-                        self.audio_buffer.clear()
-                    if self.data_send_complete_last != self.data_send_complete:
-                        print("data_send_complete: ", self.data_send_complete)
-                        self.data_send_complete_last = self.data_send_complete
-
-                    if encoded_packets:
-                        # 解码后的数据先累积到临时缓冲区
-                        temp_buffer = bytearray()
-                        for packet in encoded_packets:
-                            try:
-                                decoded_data, _ = self.audio_codec.decode_audio([packet])
-                                if len(decoded_data) > 0:
-                                    # 将解码后的数据添加到临时缓冲区
-                                    # temp_buffer.extend(decoded_data.tobytes())
-                                    # 将解码后的数据添加到循环缓冲区，自动处理容量限制
-                                    self.audio_buffer.extend(decoded_data.tobytes())
-                                else:
-                                    print("解码后的音频数据为空")
-
-                            except Exception as e:
-                                print(f"解码单个包时出错: {e}, 包类型: {type(packet)}, 包大小: {len(packet)} 字节")
-                                continue
-                        # if len(temp_buffer) >= self.CHUNK * 2:  # 确保有足够的数据
-                        #     self.play_audio(bytes(temp_buffer))
-                        #     analyze_audio_energy(bytes(temp_buffer))
-                        #     temp_buffer.clear()
-                        # 获取要处理的数据
-                        if self.data_send_complete:
-                            process_data = self.get_process_data()
-                            if process_data:
-                                print(f"检测到语音片段，长度: {len(process_data)} 字节")
-                                # 清空缓冲区
-                                self.audio_buffer.clear()
-                                self.raw_buffer.clear()
-                                # 播放语音片段
-                                self.play_audio(process_data)
-                                # current_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-                                # self.audio_saver.save_pcm(process_data, f"../server/audio_files/pcm/{current_time}.pcm")
-
-                                # 语音转文字
-                                text = self.speech_service.speech_to_text(process_data)
-                                if text:
-                                    print(f"识别到的文字: {text}")
-                                    # 调用大语言模型获取回复
-                                    response_text = await self.get_llm_response(text)
-                                    if response_text:
-                                        print(f"AI回复: {response_text}")
-                                    else:
-                                        print("get_llm_response error")
-                                    # 文字转语音
-                                    audio_data = self.speech_service.text_to_speech(response_text)
-                                    if audio_data:
-                                        await self.send_queue.put(audio_data)
-                                    else:
-                                        print("text_to_speech error")
-                                else:
-                                    print("没有识别到语音, text: ", text)
-
-                        time2 = time.time()
-                        if time2 - time1 > 1:
-                            print("process_audio_loop period over 1s: ", time2 - time1)
-                        time1 = time2
-                else:
-                    audio_data = self.read_audio("../server/audio_files/pcm/qiufeng.pcm")
-                    if audio_data:
-                        await self.send_queue.put(audio_data)
-
-                await asyncio.sleep(0.01)  # 缩短检测间隔，提高响应速度
-
-            except Exception as e:
-                print(f"处理音频数据错误: {e}")
-
-    async def send_worker(self, websocket):
-        """独立的发送协程"""
+    async def run_websocket_server(self):
+        """运行WebSocket服务器"""
         try:
-            while True:
-                # 等待发送队列中的数据
-                packets = await self.send_queue.get()
-                try:
-                    await self.send_audio_packets(websocket, packets)
-                except Exception as e:
-                    print(f"发送数据包时出错: {e}")
-                finally:
-                    self.send_queue.task_done()
-        except asyncio.CancelledError:
-            print("发送协程被取消")
+            # 保存事件循环引用
+            self.loop = asyncio.get_running_loop()
+            print("事件循环已初始化")
+            
+            async with websockets.serve(
+                self.handle_websocket,
+                "0.0.0.0",
+                80,
+                process_request=lambda path, request_headers: (
+                    None if path == "/ws/esp32-client" 
+                    else (404, [], b"Not Found")
+                )
+            ):
+                print("WebSocket server started on ws://0.0.0.0:80/ws/esp32-client")
+                await asyncio.Future()  # 保持服务器运行
         except Exception as e:
-            print(f"发送协程发生错误: {e}")
+            print(f"WebSocket服务器错误: {e}")
         finally:
-            print("发送协程结束")  # 添加日志信息
+            self.cleanup()
 
     def read_audio(self, filename):
         """读取音频文件"""
@@ -412,35 +329,124 @@ class AudioChatServer:
 
     def cleanup(self):
         """清理资源"""
-        self.recorder.cleanup()
+        self.running = False
+        # 向队列发送终止信号
+        self.audio_queue.put(None)
+        self.result_queue.put(None)
+        self.send_queue.put(None)
+        
+        # 清理各个组件
         self.player.cleanup()
         self.audio_saver.cleanup()
+        
+        # 等待线程结束
+        if hasattr(self, 'speech_thread'):
+            self.speech_thread.join()
+        if hasattr(self, 'send_thread'):
+            self.send_thread.join()
 
-    async def get_llm_response(self, text: str) -> str:
-        """获取大语言模型回复"""
-        if self.current_llm == "zhipu":
-            return await self.zhipu_client.get_response(text)
-        else:
-            return await self.volcengine_client.get_response(text)
+    async def send_audio_packets(self, websocket, audio_data):
+        """发送音频数据包"""
+        try:
+            if not websocket or not websocket.open:
+                print("WebSocket未连接")
+                return
+            
+            # 1. 编码音频
+            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+            time0 = time.time()
+            encoded_packets, _ = self.audio_codec.encode_audio(audio_array)
+            time1 = time.time()
+            print(f"音频编码时间: {time1 - time0}秒")
+            if not encoded_packets:
+                print("音频编码失败")
+                return
 
-    def play_audio(self, audio_data):
-        """将音频数据加入播放队列"""
-        self.player.play_audio(audio_data)
+            self.send_data_complete = False
+            # 2. 发送控制消息并处理音频包
+            await self._send_control(websocket, "start_playing")
+            await self._send_audio_batches(websocket, encoded_packets)
+            await self._send_control(websocket, "stop_playing")
+            self.send_data_complete = True
 
-async def main():
-    server = AudioChatServer()
-    try:
-        async with websockets.serve(
-            server.handle_websocket,  # 直接使用 handle_websocket 方法
-            "0.0.0.0", 
-            80,
-            # 如果需要路径过滤，使用 process_request
-            process_request=lambda path, request_headers: None if path == "/ws/esp32-client" else (404, [], b"Not Found")
-        ):
-            print("WebSocket server started on ws://0.0.0.0:80/ws/esp32-client")
-            await asyncio.Future()
-    finally:
-        server.cleanup()
+            await asyncio.sleep(0.5)  # 给客户端处理时间
+
+        except Exception as e:
+            print(f"发送音频数据错误: {e}")
+
+    async def _send_control(self, websocket, action):
+        """发送控制消息"""
+        await websocket.send(json.dumps({
+            "type": "control",
+            "action": f"{action}"
+        }))
+        print(f"发送{action}控制消息")
+
+    async def _send_audio_batches(self, websocket, encoded_packets):
+        """分批发送音频数据"""
+        current_batch = []
+        current_size = 0
+        batch_number = sequence_id = 0
+        
+        for packet in encoded_packets:
+            # 使用 Event 等待流控制
+            await self.flow_control_event.wait()
+            
+            packet_data = {
+                "data": base64.b64encode(packet).decode('utf-8'),
+                "length": len(packet)
+            }
+            json_size = len(json.dumps(packet_data).encode('utf-8'))
+            
+            if current_size + json_size > 512 and current_batch:
+                await self._send_batch(websocket, current_batch, batch_number, sequence_id)
+                current_batch = []
+                current_size = 0
+                batch_number += 1
+                sequence_id += 1
+                await asyncio.sleep(0.1)
+            
+            current_batch.append(packet_data)
+            current_size += json_size
+        
+        if current_batch:
+            await self._send_batch(websocket, current_batch, batch_number, sequence_id)
+
+    async def _send_batch(self, websocket, batch, batch_number, sequence_id):
+        """发送单个音频数据批次"""
+        try:
+            batch_data = {
+                "type": "audio_batch",
+                "sequence": sequence_id,
+                "batch": batch_number,
+                "total_packets": len(batch),
+                "packets": batch
+            }
+            await websocket.send(json.dumps(batch_data))
+            print(f"发送批次 {batch_number}: {len(batch)}个包, sequence={sequence_id}")
+        except Exception as e:
+            print(f"发送批次失败: {e}")
+
+    @property
+    def current_websocket(self):
+        with self._websocket_lock:
+            return self._current_websocket
+
+    @current_websocket.setter
+    def current_websocket(self, websocket):
+        with self._websocket_lock:
+            self._current_websocket = websocket
+            if websocket:
+                print(f"设置新的WebSocket连接: {id(websocket)}")
+            else:
+                print("清除WebSocket连接")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    server = AudioChatServer()
+    try:
+        # 直接在主线程中运行 WebSocket 服务器
+        asyncio.run(server.run_websocket_server())
+    except KeyboardInterrupt:
+        print("\n正在关闭服务器...")
+    finally:
+        server.cleanup()

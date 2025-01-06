@@ -86,5 +86,5 @@ class AudioRecorder:
 
     def cleanup(self):
         """清理资源"""
-        self.stop_recording()
+        # self.stop_recording()
         self.audio.terminate()

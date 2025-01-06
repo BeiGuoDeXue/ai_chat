@@ -40,10 +40,10 @@ static const char *TAG = "MAIN";
 
 // WebSocket配置
 static esp_websocket_client_handle_t client = NULL;
-static const char* WS_URI = "ws://192.168.32.138:80/ws/esp32-client";
+static const char* WS_URI = "ws://192.168.31.79:80/ws/esp32-client";
 
 // WiFi配置
-#define WIFI_SSID "zhaokangxu"
+#define WIFI_SSID "2806"
 #define WIFI_PASS "zhaokangxu"
 
 // Opus编码器
@@ -508,7 +508,7 @@ static void flow_control_task(void* arg) {
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
-    static uint32_t last_sequence_id = 0;
+    static uint32_t last_sequence_id = 0;  // 保持静态声明
     static int64_t last_time = 0;
     static char *message_buffer = NULL;
     static size_t message_len = 0;
@@ -518,6 +518,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             ESP_LOGI(TAG, "WEBSOCKET_EVENT_CONNECTED");
             try_transition_to(CHAT_STATE_IDLE);
             wsConnected = true;
+            last_sequence_id = 0;  // 连接时重置序列号
             break;
             
         case WEBSOCKET_EVENT_DISCONNECTED:
@@ -527,6 +528,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                 message_buffer = NULL;
             }
             message_len = 0;
+            last_sequence_id = 0;  // 断开连接时重置序列号
             try_transition_to(CHAT_STATE_CONNECTING);
             wsConnected = false;
             break;
@@ -666,6 +668,8 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                             cJSON *action = cJSON_GetObjectItem(root, "action");
                             if (action && cJSON_IsString(action)) {
                                 if (strcmp(action->valuestring, "start_playing") == 0) {
+                                    // 新对话开始，重置序列号
+                                    last_sequence_id = 0;
                                     // 收到开始播放指令，切换到播放状态
                                     try_transition_to(CHAT_STATE_SPEAKING);
                                     is_speaking = true;
@@ -1379,6 +1383,7 @@ void app_main(void)
 {
     // 初始化日志
     ESP_LOGI(TAG, "Starting application...");
+    // esp_log_level_set(TAG, ESP_LOG_DEBUG);
 
     // 检查PSRAM
     size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
